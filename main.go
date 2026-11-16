@@ -88,18 +88,19 @@ type env struct {
 func main() { os.Exit(run()) }
 
 func run() int {
-	auto := flag.Bool("y", false, "przyjmij daty wykryte w podpisach bez pytania i nie czekaj na Enter na końcu")
+	ask := flag.Bool("pytaj", false, "pytaj o datę każdego podpisu (domyślnie przyjmowana jest najsilniejsza data wykryta w podpisie)")
+	noWait := flag.Bool("y", false, "nie czekaj na Enter na końcu (do skryptów)")
 	outDir := flag.String("o", "", "katalog na raport (domyślnie: nowy katalog obok pierwszego pliku)")
 	offline := flag.Bool("offline", false, "bez połączeń sieciowych (tylko dane osadzone w PDF; bez list zaufanych usług wynik będzie nierozstrzygający)")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "weryfikator-podpisow %s — ważność podpisów PAdES na dzień podpisania\n\n"+
-			"Użycie: weryfikator-podpisow.exe [-y] [-o katalog] plik.pdf|katalog ...\n"+
+			"Użycie: weryfikator-podpisow.exe [-pytaj] [-y] [-offline] [-o katalog] plik.pdf|katalog ...\n"+
 			"(można też przeciągnąć pliki lub katalog na ikonę programu)\n\n", version)
 		flag.PrintDefaults()
 	}
 	flag.Parse()
-	e := &env{in: bufio.NewReader(os.Stdin), auto: *auto}
-	if !*auto {
+	e := &env{in: bufio.NewReader(os.Stdin), auto: !*ask}
+	if !*noWait {
 		defer func() {
 			fmt.Print("\nNaciśnij Enter, aby zakończyć...")
 			e.in.ReadString('\n')
@@ -605,7 +606,7 @@ func (e *env) askDate(fname string, n int, signer string, cands []dateCand) date
 			fmt.Print("  Brak daty w podpisie. Wpisz RRRR-MM-DD GG:MM[:SS] (czas lokalny) albo Enter, aby pominąć: ")
 		}
 		line, err := e.in.ReadString('\n')
-		line = strings.TrimSpace(line)
+		line = strings.TrimSpace(strings.TrimLeft(line, string(rune(0xFEFF)))) // BOM from PowerShell pipes
 		if line == "" {
 			if len(cands) > 0 {
 				return cands[0]

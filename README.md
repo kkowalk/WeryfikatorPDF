@@ -20,24 +20,27 @@ Opcja `-offline` wyłącza wszystkie połączenia. Szczegóły: [polityka prywat
 Przeciągnij pliki PDF lub katalog na `weryfikator-podpisow.exe`, albo:
 
 ```
-weryfikator-podpisow.exe [-y] [-o katalog_raportu] plik.pdf katalog\ ...
+weryfikator-podpisow.exe [-pytaj] [-y] [-offline] [-o katalog_raportu] plik.pdf katalog\ ...
 ```
 
 | Opcja | Znaczenie |
 |---|---|
-| `-y` | przyjmij daty wykryte w podpisach bez pytania; nie czekaj na Enter na końcu |
+| `-pytaj` | pytaj o datę każdego podpisu (domyślnie przyjmowana jest data wykryta w podpisie) |
+| `-y` | nie czekaj na Enter na końcu (do skryptów) |
 | `-o` | katalog raportu (domyślnie `weryfikacja-podpisow-<data>` obok pierwszego pliku) |
 | `-offline` | bez połączeń sieciowych; wynik będzie nierozstrzygający, bo nie da się wtedy sprawdzić list zaufanych usług |
 
 Gotowy plik `.exe` pobierzesz z [Releases](../../releases). Sprawdź [Code signing policy](#code-signing-policy).
 
-Dla każdego podpisu program pokazuje wykryte daty od najsilniejszego dowodu. Enter przyjmuje proponowaną
-datę. Można też wpisać inną datę (`RRRR-MM-DD GG:MM[:SS]`, czas lokalny), np. gdy użytkownik wie, kiedy
-plik podpisano.
+Domyślnie program przyjmuje dla każdego podpisu najsilniejszą wykrytą datę i pokazuje w konsoli wszystkie
+daty znalezione w podpisie. Z opcją `-pytaj` czeka na decyzję: Enter przyjmuje proponowaną datę, można też
+wpisać inną (`RRRR-MM-DD GG:MM[:SS]`, czas lokalny), np. gdy użytkownik wie, kiedy plik podpisano.
+Podpis bez żadnej daty przy domyślnym trybie dostaje wynik nierozstrzygający.
 
 Wynik:
 - `index.html` — zestawienie zbiorcze i log zapytań sieciowych,
-- `NNN-<plik>.html` — raport dla każdego pliku (do druku lub zapisu do PDF jako załącznik do akt),
+- `NNN-<plik>.html` — raport dla każdego pliku. Przycisk „Drukuj raport” otwiera okno drukowania przeglądarki;
+  stamtąd można wydrukować raport albo zapisać go jako PDF, np. jako załącznik do akt.
 - `podsumowanie.csv` — UTF-8, separator `;`,
 - `dowody/` — kopie użytych certyfikatów, CRL, OCSP i list zaufanych usług, a przy zmianach po podpisaniu
   także wersja PDF, którą faktycznie podpisano.

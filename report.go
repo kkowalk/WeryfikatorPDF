@@ -31,7 +31,8 @@ tr.unknown td:nth-child(2),tr.warn td:nth-child(2){color:#a16207;font-weight:700
 .lg .sign{background:#dbeafe;border-color:#1d4ed8}.lg .start{background:#ecfdf3;border-color:#16a34a}
 .lg .stop{background:#fff7ed;border-color:#ea580c}.lg .revoke{background:#fef2f2;border-color:#dc2626}
 .note{color:#9a3412}
-ul.ev{margin:0;padding-left:16px}@media print{*{print-color-adjust:exact;-webkit-print-color-adjust:exact}a{color:inherit}h2{break-before:page}}`
+ul.ev{margin:0;padding-left:16px}
+.print{float:right;font:inherit;padding:6px 14px;cursor:pointer}@media print{.print{display:none}*{print-color-adjust:exact;-webkit-print-color-adjust:exact}a{color:inherit}h2{break-before:page}}`
 
 const methodology = `<h2>Metodyka i ograniczenia</h2>
 <ul class="small">
@@ -49,6 +50,7 @@ nie jest analizowane uprawnienie do zmian po podpisaniu (DocMDP) — wykrywane s
 
 var fileTpl = template.Must(template.New("f").Parse(`<!doctype html><html lang="pl"><head><meta charset="utf-8">
 <title>Weryfikacja — {{.F.Name}}</title><style>` + css + `</style></head><body>
+<button class="print" type="button" onclick="window.print()">Drukuj raport</button>
 <p class="small"><a href="index.html">← raport zbiorczy</a></p>
 <h1>Weryfikacja podpisów na dzień podpisania</h1>
 <p class="verdict {{.F.VerdictClass}}">{{.F.Verdict}}</p>
@@ -100,6 +102,7 @@ var fileTpl = template.Must(template.New("f").Parse(`<!doctype html><html lang="
 
 var indexTpl = template.Must(template.New("i").Parse(`<!doctype html><html lang="pl"><head><meta charset="utf-8">
 <title>Weryfikacja podpisów — raport zbiorczy</title><style>` + css + `</style></head><body>
+<button class="print" type="button" onclick="window.print()">Drukuj raport</button>
 <h1>Weryfikacja podpisów na dzień podpisania — raport zbiorczy</h1>
 <p class="small">Wygenerowano {{.Gen}} — {{.Tool}}. Zestawienie CSV: <a href="podsumowanie.csv">podsumowanie.csv</a></p>
 <table><tr><th>Plik</th><th>Wynik</th><th>Podpisy</th></tr>
