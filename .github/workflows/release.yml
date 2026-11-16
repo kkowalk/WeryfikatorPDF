@@ -2,6 +2,8 @@
 # Trigger: push a tag v*, e.g. `git tag v0.1.0 && git push origin v0.1.0`.
 # Until repository variable SIGNPATH_ORGANIZATION_ID is set, the release is published unsigned
 # (SignPath Foundation requires the project to be already released before applying).
+# Actions are pinned to commit SHAs; the build job (which runs project code and go-winres)
+# has read-only permissions and no access to secrets or the OIDC token.
 name: release
 
 on:
@@ -12,23 +14,21 @@ permissions:
   contents: read
 
 jobs:
-  release:
+  build:
     runs-on: ubuntu-latest # SignPath OSS requires GitHub-hosted runners
-    permissions:
-      contents: write     # create the GitHub Release
-      actions: read       # SignPath fetches the uploaded artifact
-      id-token: write     # build provenance attestation
-      attestations: write
+    outputs:
+      artifact-id: ${{ steps.unsigned.outputs.artifact-id }}
     env:
       EXE: weryfikator-podpisow.exe
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      - uses: actions/setup-go@v7
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
+          cache: false # no cache restore into a release build
 
       - run: go test ./...
 
@@ -51,21 +51,37 @@ jobs:
 
       - name: Upload unsigned artifact
         id: unsigned
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: unsigned
           path: ${{ env.EXE }}
           if-no-files-found: error
 
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: release # add required reviewers in Settings → Environments
+    permissions:
+      contents: write     # create the GitHub Release
+      actions: read       # SignPath fetches the uploaded artifact
+      id-token: write     # build provenance attestation
+      attestations: write
+    env:
+      EXE: weryfikator-podpisow.exe
+    steps:
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: unsigned
+
       - name: Sign (SignPath Foundation, manual approval)
         if: vars.SIGNPATH_ORGANIZATION_ID != ''
-        uses: signpath/github-action-submit-signing-request@v3
+        uses: signpath/github-action-submit-signing-request@f6d04783b4569d051e0c80105fe66e82819d0092 # v3.0
         with:
           api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
           organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
           project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG }}
           signing-policy-slug: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG }}
-          github-artifact-id: ${{ steps.unsigned.outputs.artifact-id }}
+          github-artifact-id: ${{ needs.build.outputs.artifact-id }}
           wait-for-completion: true
           wait-for-completion-timeout-in-seconds: 7200
           output-artifact-directory: signed
@@ -78,13 +94,14 @@ jobs:
 
       - name: Build provenance attestation (public repos; private ones need GitHub Enterprise Cloud)
         if: github.event.repository.visibility == 'public'
-        uses: actions/attest-build-provenance@v4
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: ${{ env.EXE }}
 
       - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
           gh release create "$GITHUB_REF_NAME" "$EXE" SHA256SUMS --title "$GITHUB_REF_NAME" --generate-notes \
             --notes "Code signing policy: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY#code-signing-policy"

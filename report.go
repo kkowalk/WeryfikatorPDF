@@ -17,7 +17,7 @@ h1{font-size:22px}h2{font-size:18px;margin-top:32px;border-top:1px solid #ccc;pa
 table{border-collapse:collapse;width:100%;margin:8px 0}th,td{border:1px solid #ddd;padding:4px 8px;text-align:left;vertical-align:top}
 th{background:#f4f4f6}.kv th{width:220px}.mono{font-family:Consolas,monospace;word-break:break-all}
 .verdict{font-weight:700;font-size:16px;padding:10px 14px;border-radius:6px}
-.verdict.ok{background:#e3f4e6;color:#14532d}.verdict.fail{background:#fde4e4;color:#7f1d1d}.verdict.unknown{background:#fff4d6;color:#713f12}
+.verdict.ok{background:#e3f4e6;color:#14532d}.verdict.fail{background:#fde4e4;color:#7f1d1d}.verdict.unknown{background:#fff4d6;color:#713f12}.verdict.warn{background:#eef6d3;color:#3f6212}
 tr.fail td:nth-child(2){color:#b91c1c;font-weight:700}tr.ok td:nth-child(2){color:#15803d;font-weight:700}
 tr.unknown td:nth-child(2),tr.warn td:nth-child(2){color:#a16207;font-weight:700}
 .small{font-size:12px;color:#555}h4{font-size:14px;margin:14px 0 4px}
@@ -39,12 +39,17 @@ const methodology = `<h2>Metodyka i ograniczenia</h2>
 <li>Ocena dotyczy stanu <b>na dzień podpisania</b> (dzień oceny podany w raporcie), nie na dzień sporządzenia raportu.
 Kryteria: art. 32 ust. 1 rozporządzenia eIDAS (UE) nr 910/2014; utrata ważności certyfikatu z chwilą unieważnienia — art. 28 ust. 4 eIDAS
 (<a href="https://eur-lex.europa.eu/eli/reg/2014/910/oj">EUR-Lex</a>); procedura walidacji wzorowana na ETSI EN 319 102-1; listy zaufanych usług wg ETSI TS 119 612; CRL wg RFC 5280; OCSP wg RFC 6960.</li>
-<li>Siła dowodowa daty: kwalifikowany znacznik czasu &gt; niekwalifikowany znacznik czasu &gt; deklaracja podpisującego (signingTime, /M) &gt; data podana ręcznie.
-Znacznik czasu dowodzi, że podpis istniał <i>najpóźniej</i> w chwili znacznika. Data podana ręcznie to oświadczenie użytkownika — wynik „ważny” jest wtedy warunkowy.</li>
+<li>Siła dowodowa daty: kwalifikowany znacznik czasu &gt; niekwalifikowany znacznik czasu z TSA powiązanego z listą zaufanych usług &gt;
+znacznik czasu z niezweryfikowanego TSA, deklaracja podpisującego (signingTime, /M) i data podana ręcznie.
+Znacznik czasu dowodzi, że podpis istniał <i>najpóźniej</i> w chwili znacznika. Gdy data nie jest potwierdzona zaufanym znacznikiem czasu,
+wynik „ważny” jest wydawany <b>z zastrzeżeniem</b> — zakłada, że podpis złożono w przyjętej dacie, co użytkownik może potwierdzić z innych źródeł.</li>
+<li>Wynik „ważny” wymaga, aby na przyjętą datę: każdy certyfikat ścieżki był w okresie ważności i nieunieważniony, każdy wystawca był urzędem certyfikacji
+(cA, keyCertSign, pathLenConstraint — RFC 5280), a usługa wystawcy na liście zaufanych usług była typu CA/QC lub CA/PKC ze statusem pozytywnym.
+„Ważny z zastrzeżeniami” oznacza spełnienie tych warunków przy co najmniej jednym ostrzeżeniu (kontrole oznaczone UWAGA).</li>
 <li>Dokument nie był nigdzie wysyłany. Z sieci pobrano wyłącznie listy zaufanych usług (LOTL i krajowe), listy CRL oraz odpowiedzi OCSP (zapytanie OCSP zawiera numer seryjny certyfikatu).
 Wszystkie wykorzystane dane zapisano w katalogu <span class="mono">dowody/</span> — można je zweryfikować niezależnie.</li>
 <li>Ograniczenia wersji: podpisy XML list zaufanych usług nie są weryfikowane (integralność zapewnia HTTPS ze źródeł wskazanych w LOTL);
-kwalifikatory usług (ServiceInformationExtensions) nie są uwzględniane; nie jest sprawdzany status unieważnienia certyfikatów TSA i delegowanych responderów OCSP;
+z kwalifikatorów usług (ServiceInformationExtensions) uwzględniany jest tylko zakres ForeSignatures/ForeSeals z bieżącego wpisu; nie jest sprawdzany status unieważnienia certyfikatów TSA i delegowanych responderów OCSP;
 nie jest analizowane uprawnienie do zmian po podpisaniu (DocMDP) — wykrywane są jedynie zmiany poza zakresem podpisu; obsługiwane jest kodowanie DER podpisu CMS.</li>
 </ul>`
 
@@ -114,10 +119,15 @@ var indexTpl = template.Must(template.New("i").Parse(`<!doctype html><html lang=
 {{range .Log}}<tr><td>{{.When}}</td><td>{{.Method}}</td><td class="mono small">{{.URL}}</td><td>{{.Result}}</td><td>{{if .File}}<a href="{{.File}}">plik</a>{{end}}</td></tr>{{end}}</table>
 ` + methodology + `</body></html>`))
 
+// createPrivate: reports contain document copies and evidence — owner-only on Linux.
+func createPrivate(name string) (*os.File, error) {
+	return os.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+}
+
 func tool() string { return "weryfikator-podpisow " + version }
 
 func writeFileReport(dir string, fr *fileReport) error {
-	f, err := os.Create(filepath.Join(dir, fr.Report))
+	f, err := createPrivate(filepath.Join(dir, fr.Report))
 	if err != nil {
 		return err
 	}
@@ -126,7 +136,7 @@ func writeFileReport(dir string, fr *fileReport) error {
 }
 
 func writeIndex(dir string, frs []*fileReport, e *env) error {
-	f, err := os.Create(filepath.Join(dir, "index.html"))
+	f, err := createPrivate(filepath.Join(dir, "index.html"))
 	if err != nil {
 		return err
 	}
@@ -140,7 +150,7 @@ func writeIndex(dir string, frs []*fileReport, e *env) error {
 
 // writeCSV: UTF-8 BOM and ';' for Polish Excel; cells neutralised against formula injection.
 func writeCSV(name string, frs []*fileReport) error {
-	f, err := os.Create(name)
+	f, err := createPrivate(name)
 	if err != nil {
 		return err
 	}

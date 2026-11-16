@@ -6,8 +6,10 @@ import (
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"path"
@@ -33,10 +35,10 @@ func (e *evidence) save(prefix, ext string, b []byte) string {
 		return p
 	}
 	name := fmt.Sprintf("%s-%x.%s", prefix, h[:8], ext)
-	if err := os.MkdirAll(filepath.Join(e.dir, "dowody"), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Join(e.dir, "dowody"), 0o700); err != nil {
 		return ""
 	}
-	if err := os.WriteFile(filepath.Join(e.dir, "dowody", name), b, 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(e.dir, "dowody", name), b, 0o600); err != nil {
 		return ""
 	}
 	e.saved[h] = "dowody/" + name
@@ -59,6 +61,24 @@ type netFetcher struct {
 	cache   map[string]fetched
 	Log     []fetchLog
 	offline bool
+}
+
+// checkRedirect blocks HTTPS→HTTP downgrades and redirects to local/private addresses.
+// ponytail: only IP literals and "localhost" are checked; host names resolving to private
+// addresses pass (a Dialer.Control check would also block corporate proxies).
+func checkRedirect(req *http.Request, via []*http.Request) error {
+	if len(via) >= 5 {
+		return errors.New("zbyt wiele przekierowań")
+	}
+	if via[0].URL.Scheme == "https" && req.URL.Scheme != "https" {
+		return errors.New("przekierowanie z HTTPS na HTTP zablokowane")
+	}
+	h := req.URL.Hostname()
+	if ip := net.ParseIP(h); strings.EqualFold(h, "localhost") || ip != nil &&
+		(ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsUnspecified()) {
+		return errors.New("przekierowanie na adres lokalny zablokowane")
+	}
+	return nil
 }
 
 // do performs a GET (body==nil) or POST. Only data derived from certificates
@@ -140,6 +160,7 @@ type tslXML struct {
 			Certs   []string `xml:"ServiceInformation>ServiceDigitalIdentity>DigitalId>X509Certificate"`
 			Status  string   `xml:"ServiceInformation>ServiceStatus"`
 			Start   string   `xml:"ServiceInformation>StatusStartingTime"`
+			ASI     []string `xml:"ServiceInformation>ServiceInformationExtensions>Extension>AdditionalServiceInformation>URI"`
 			History []struct {
 				Type   string `xml:"ServiceTypeIdentifier"`
 				Status string `xml:"ServiceStatus"`
@@ -159,6 +180,7 @@ type tlEntry struct {
 	Cert                  *x509.Certificate
 	Timeline              []tlStatus // ascending by Start
 	File, URL             string
+	ASI                   []string // AdditionalServiceInformation URIs (ForeSignatures, ForeSeals, ...)
 }
 
 // at returns the service status/type in force at t (ServiceHistory included).
@@ -171,6 +193,39 @@ func (e *tlEntry) at(t time.Time) (tlStatus, bool) {
 		}
 	}
 	return cur, ok
+}
+
+// allows reports whether the service may issue certificates for signatures (or seals).
+// ponytail: ASI of the current entry only; ServiceHistory qualifiers are not read.
+func (e *tlEntry) allows(seal bool) bool {
+	want := map[bool]string{false: "/ForeSignatures", true: "/ForeSeals"}[seal]
+	for _, u := range e.ASI {
+		if strings.HasSuffix(strings.TrimSpace(u), want) {
+			return true
+		}
+	}
+	return len(e.ASI) == 0
+}
+
+// anchorState: ok only if some matching service was a CA (CA/QC or CA/PKC) with a positive
+// status at t; fail if the service had a negative status at t; otherwise unknown.
+func anchorState(anchor []*tlEntry, t time.Time) (state, detail string) {
+	state, detail = "unknown", "Wystawca nie figurował na liście zaufanych usług w dniu podpisu (brak wpisu usługi na tę datę)."
+	for _, a := range anchor {
+		st, ok := a.at(t)
+		switch {
+		case !ok:
+		case positive(st.Status) && (strings.HasSuffix(st.Type, "/CA/QC") || strings.HasSuffix(st.Type, "/CA/PKC")):
+			return "ok", fmt.Sprintf("%s — %s (%s), status %s od %s", a.TSP, a.Service, a.Country, path.Base(st.Status), fmtTime(st.Start))
+		case !positive(st.Status):
+			state, detail = "fail", fmt.Sprintf("Usługa wystawcy „%s” (%s, %s) miała na dzień podpisu status %s (od %s) — wystawca nie był wtedy zaufany.",
+				a.Service, a.TSP, a.Country, path.Base(st.Status), fmtTime(st.Start))
+		case state == "unknown":
+			detail = fmt.Sprintf("Usługa „%s” (%s) jest typu %s — nie jest usługą wydawania certyfikatów (CA/QC, CA/PKC).",
+				a.Service, a.TSP, strings.TrimPrefix(st.Type, "http://uri.etsi.org/TrstSvc/Svctype/"))
+		}
+	}
+	return state, detail
 }
 
 func positive(status string) bool {
@@ -255,7 +310,7 @@ func (t *trust) load(cc string) {
 				if err != nil {
 					continue
 				}
-				t.entries = append(t.entries, &tlEntry{cc, first(p.Names), first(s.Names), cert, tl, file, u})
+				t.entries = append(t.entries, &tlEntry{cc, first(p.Names), first(s.Names), cert, tl, file, u, s.ASI})
 			}
 		}
 	}
@@ -286,8 +341,9 @@ func (t *trust) match(c *x509.Certificate) []*tlEntry {
 }
 
 // chain walks issuers from leaf until a certificate listed on an EU TL is reached.
+// err reports a structurally invalid path (non-CA issuer, CA leaf, pathLen exceeded).
 // ponytail: no AIA fetching — URLs from untrusted certificates are never contacted.
-func (t *trust) chain(leaf *x509.Certificate, pool []*x509.Certificate) ([]*x509.Certificate, []*tlEntry) {
+func (t *trust) chain(leaf *x509.Certificate, pool []*x509.Certificate) ([]*x509.Certificate, []*tlEntry, error) {
 	all := append([]*x509.Certificate{}, pool...)
 	for _, e := range t.entries {
 		all = append(all, e.Cert)
@@ -295,24 +351,48 @@ func (t *trust) chain(leaf *x509.Certificate, pool []*x509.Certificate) ([]*x509
 	chain := []*x509.Certificate{leaf}
 	for cur := leaf; len(chain) <= 8; {
 		if m := t.match(cur); len(m) > 0 {
-			return chain, m
+			return chain, m, pathErr(chain)
 		}
-		next := findIssuer(cur, all)
+		next, nonCA := findIssuer(cur, all)
+		if nonCA != nil {
+			return append(chain, nonCA), nil, fmt.Errorf("certyfikat %s został wystawiony przez certyfikat %s, który nie jest certyfikatem urzędu certyfikacji (brak cA/keyCertSign) — ścieżka nieprawidłowa, możliwe fałszerstwo", cn(cur), cn(nonCA))
+		}
 		if next == nil {
-			return chain, nil
+			return chain, nil, pathErr(chain)
 		}
 		chain = append(chain, next)
 		cur = next
 	}
-	return chain, nil
+	return chain, nil, pathErr(chain)
 }
 
-func findIssuer(c *x509.Certificate, pool []*x509.Certificate) *x509.Certificate {
-	for _, p := range pool {
-		if !bytes.Equal(p.Raw, c.Raw) && bytes.Equal(p.RawSubject, c.RawIssuer) &&
-			checkSigned(p, c.SignatureAlgorithm, c.RawTBSCertificate, c.Signature) == nil {
-			return p
+func isCA(c *x509.Certificate) bool {
+	return c.BasicConstraintsValid && c.IsCA && (c.KeyUsage == 0 || c.KeyUsage&x509.KeyUsageCertSign != 0)
+}
+
+// pathErr checks the leaf is not a CA and every CA's pathLenConstraint (RFC 5280 §4.2.1.9).
+func pathErr(chain []*x509.Certificate) error {
+	if len(chain) > 1 && chain[0].BasicConstraintsValid && chain[0].IsCA {
+		return fmt.Errorf("certyfikat %s jest certyfikatem urzędu certyfikacji, a nie certyfikatem końcowym", cn(chain[0]))
+	}
+	for i, c := range chain[1:] { // i = number of intermediate CAs below c
+		if (c.MaxPathLen > 0 || c.MaxPathLenZero) && i > c.MaxPathLen {
+			return fmt.Errorf("przekroczone ograniczenie długości ścieżki (pathLenConstraint=%d) certyfikatu %s", c.MaxPathLen, cn(c))
 		}
 	}
 	return nil
+}
+
+// findIssuer returns the CA that signed c; nonCA is set when only a non-CA certificate did.
+func findIssuer(c *x509.Certificate, pool []*x509.Certificate) (issuer, nonCA *x509.Certificate) {
+	for _, p := range pool {
+		if !bytes.Equal(p.Raw, c.Raw) && bytes.Equal(p.RawSubject, c.RawIssuer) &&
+			checkSigned(p, c.SignatureAlgorithm, c.RawTBSCertificate, c.Signature) == nil {
+			if isCA(p) {
+				return p, nil
+			}
+			nonCA = p
+		}
+	}
+	return nil, nonCA
 }

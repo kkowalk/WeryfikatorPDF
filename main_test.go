@@ -97,7 +97,7 @@ func TestPAdESEndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := c.verify(sigs[0].Signed); err != nil {
+	if err := c.verify(sigs[0].Signed...); err != nil {
 		t.Fatal("valid signature rejected:", err)
 	}
 	if present, err := c.checkESS(); !present || err != nil {
@@ -106,7 +106,7 @@ func TestPAdESEndToEnd(t *testing.T) {
 	// tamper with a signed byte outside /Contents
 	bad := append([]byte{}, pdf...)
 	bad[3] ^= 1
-	if err := c.verify(findSignatures(bad)[0].Signed); err == nil {
+	if err := c.verify(findSignatures(bad)[0].Signed...); err == nil {
 		t.Fatal("tampered document accepted")
 	}
 }
@@ -164,4 +164,118 @@ func buildCMS(t *testing.T, content []byte, cert *x509.Certificate, key *ecdsa.P
 			SignedAttrs:        asn1.RawValue{Class: 2, Tag: 0, IsCompound: true, Bytes: attrs},
 			SignatureAlgorithm: pkix.AlgorithmIdentifier{Algorithm: oid("1.2.840.10045.4.3.2")}, Signature: sig}}}
 	return must(asn1.Marshal(contentInfo{oidSignedData, asn1.RawValue{Class: 2, Tag: 0, IsCompound: true, Bytes: must(asn1.Marshal(sd))}}))
+}
+
+func issue(t *testing.T, tpl, parent *x509.Certificate, parentKey *ecdsa.PrivateKey) (*x509.Certificate, *ecdsa.PrivateKey) {
+	key, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if parent == nil {
+		parent, parentKey = tpl, key
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tpl, parent, &key.PublicKey, parentKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, _ := x509.ParseCertificate(der)
+	return c, key
+}
+
+func tlWith(ca *x509.Certificate, typ, status string, start time.Time) *trust {
+	return &trust{loaded: map[string]bool{"PL": true}, entries: []*tlEntry{{Country: "PL", TSP: "TSP", Service: "Usługa", Cert: ca,
+		Timeline: []tlStatus{{start, "http://uri.etsi.org/TrstSvc/TrustedList/Svcstatus/" + status, "http://uri.etsi.org/TrstSvc/Svctype/" + typ}}}}}
+}
+
+func TestChainRequiresCAIssuers(t *testing.T) {
+	ca, leaf, caKey, _ := pki(t, S.AddDate(1, 0, 0))
+	tr := tlWith(ca, "CA/QC", "granted", S.AddDate(-1, 0, 0))
+	if _, anchor, err := tr.chain(leaf, nil); err != nil || anchor == nil {
+		t.Fatalf("valid chain rejected: %v %v", anchor, err)
+	}
+	// an end-entity certificate (no basicConstraints cA) must not act as an issuer
+	ee, eeKey := issue(t, &x509.Certificate{SerialNumber: big.NewInt(7), Subject: pkix.Name{CommonName: "Atakujący"},
+		NotBefore: S.AddDate(-1, 0, 0), NotAfter: S.AddDate(1, 0, 0), KeyUsage: x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign}, ca, caKey)
+	forged, _ := issue(t, &x509.Certificate{SerialNumber: big.NewInt(8), Subject: pkix.Name{CommonName: "Jan Kowalski"},
+		NotBefore: S.AddDate(-1, 0, 0), NotAfter: S.AddDate(1, 0, 0), KeyUsage: x509.KeyUsageContentCommitment}, ee, eeKey)
+	if _, anchor, err := tr.chain(forged, []*x509.Certificate{ee}); err == nil || anchor != nil {
+		t.Fatalf("chain through non-CA accepted: %v %v", anchor, err)
+	}
+	// pathLenConstraint=0 forbids an intermediate CA below
+	ca0, ca0Key := issue(t, &x509.Certificate{SerialNumber: big.NewInt(9), Subject: pkix.Name{CommonName: "CA0"},
+		NotBefore: S.AddDate(-1, 0, 0), NotAfter: S.AddDate(1, 0, 0), IsCA: true, BasicConstraintsValid: true, MaxPathLenZero: true,
+		KeyUsage: x509.KeyUsageCertSign}, nil, nil)
+	sub, subKey := issue(t, &x509.Certificate{SerialNumber: big.NewInt(10), Subject: pkix.Name{CommonName: "Sub"},
+		NotBefore: S.AddDate(-1, 0, 0), NotAfter: S.AddDate(1, 0, 0), IsCA: true, BasicConstraintsValid: true, KeyUsage: x509.KeyUsageCertSign}, ca0, ca0Key)
+	l2, _ := issue(t, &x509.Certificate{SerialNumber: big.NewInt(11), Subject: pkix.Name{CommonName: "L2"},
+		NotBefore: S.AddDate(-1, 0, 0), NotAfter: S.AddDate(1, 0, 0)}, sub, subKey)
+	if _, _, err := tlWith(ca0, "CA/QC", "granted", S.AddDate(-1, 0, 0)).chain(l2, []*x509.Certificate{sub}); err == nil {
+		t.Fatal("pathLenConstraint ignored")
+	}
+}
+
+func TestAnchorState(t *testing.T) {
+	ca, _, _, _ := pki(t, S.AddDate(1, 0, 0))
+	for _, c := range []struct {
+		typ, status string
+		start       time.Time
+		want        string
+	}{
+		{"CA/QC", "granted", S.AddDate(-1, 0, 0), "ok"},
+		{"CA/QC", "withdrawn", S.AddDate(0, -1, 0), "fail"},
+		{"CA/QC", "granted", S.AddDate(0, 1, 0), "unknown"}, // listed only after S
+		{"TSA/QTST", "granted", S.AddDate(-1, 0, 0), "unknown"},
+	} {
+		if got, _ := anchorState(tlWith(ca, c.typ, c.status, c.start).entries, S); got != c.want {
+			t.Errorf("%s %s %v: got %s, want %s", c.typ, c.status, c.start, got, c.want)
+		}
+	}
+}
+
+func TestEvalTSTiers(t *testing.T) {
+	ca, _, caKey, _ := pki(t, S.AddDate(1, 0, 0))
+	tsaTpl := func(eku []x509.ExtKeyUsage) *x509.Certificate {
+		return &x509.Certificate{SerialNumber: big.NewInt(20), Subject: pkix.Name{CommonName: "TSA"},
+			NotBefore: S.AddDate(-1, 0, 0), NotAfter: S.AddDate(1, 0, 0), ExtKeyUsage: eku}
+	}
+	tsEKU := []x509.ExtKeyUsage{x509.ExtKeyUsageTimeStamping}
+	tsa, _ := issue(t, tsaTpl(tsEKU), ca, caKey)
+	noEKU, _ := issue(t, tsaTpl(nil), ca, caKey)
+	self, _ := issue(t, tsaTpl(tsEKU), nil, nil)
+	for _, c := range []struct {
+		name string
+		tsa  *x509.Certificate
+		tr   *trust
+		want int
+	}{
+		{"kwalifikowany", tsa, tlWith(ca, "TSA/QTST", "granted", S.AddDate(-1, 0, 0)), 0},
+		{"zaufany niekwalifikowany", tsa, tlWith(ca, "CA/QC", "granted", S.AddDate(-1, 0, 0)), 1},
+		{"bez EKU", noEKU, tlWith(ca, "TSA/QTST", "granted", S.AddDate(-1, 0, 0)), 2},
+		{"self-signed", self, tlWith(ca, "TSA/QTST", "granted", S.AddDate(-1, 0, 0)), 2},
+		{"usługa wycofana", tsa, tlWith(ca, "TSA/QTST", "withdrawn", S.AddDate(0, -1, 0)), 2},
+	} {
+		e := &env{trust: c.tr}
+		if _, tier, err := e.evalTS(&tsResult{GenTime: S, TSA: c.tsa}, newPool()); err != nil || tier != c.want {
+			t.Errorf("%s: tier %d err %v, want %d", c.name, tier, err, c.want)
+		}
+	}
+}
+
+func TestCheckIDP(t *testing.T) {
+	idp := func(uri string, onlyCA bool) []byte {
+		gn, _ := asn1.Marshal(asn1.RawValue{Class: 2, Tag: 6, Bytes: []byte(uri)})
+		full, _ := asn1.Marshal(asn1.RawValue{Class: 2, Tag: 0, IsCompound: true, Bytes: gn})
+		b, _ := asn1.Marshal(struct {
+			DP     asn1.RawValue
+			OnlyCA bool `asn1:"optional,tag:2"`
+		}{asn1.RawValue{Class: 2, Tag: 0, IsCompound: true, Bytes: full}, onlyCA})
+		return b
+	}
+	cert := &x509.Certificate{CRLDistributionPoints: []string{"http://ca.example/crl1.crl"}}
+	if p := checkIDP(idp("http://ca.example/crl1.crl", false), cert); p != "" {
+		t.Error("matching IDP rejected:", p)
+	}
+	if checkIDP(idp("http://ca.example/crl1.crl0", false), cert) == "" {
+		t.Error("IDP matched by substring")
+	}
+	if checkIDP(idp("http://ca.example/crl1.crl", true), cert) == "" {
+		t.Error("onlyContainsCACerts CRL accepted for an end-entity certificate")
+	}
 }

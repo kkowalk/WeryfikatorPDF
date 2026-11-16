@@ -182,19 +182,21 @@ func findSigner(sid asn1.RawValue, certs []*x509.Certificate) *x509.Certificate 
 	return nil
 }
 
-func digest(h crypto.Hash, data []byte) []byte {
+func digest(h crypto.Hash, parts ...[]byte) []byte {
 	w := h.New()
-	w.Write(data)
+	for _, p := range parts {
+		w.Write(p)
+	}
 	return w.Sum(nil)
 }
 
-// verify checks messageDigest against content and the signature over signed attributes.
-func (c *cmsSig) verify(content []byte) error {
+// verify checks messageDigest against content (concatenated parts) and the signature over signed attributes.
+func (c *cmsSig) verify(content ...[]byte) error {
 	h, ok := hashByOID[c.si.DigestAlgorithm.Algorithm.String()]
 	if !ok {
 		return fmt.Errorf("nieobsługiwany algorytm skrótu %s", c.si.DigestAlgorithm.Algorithm)
 	}
-	d := digest(h, content)
+	d := digest(h, content...)
 	pss := c.si.SignatureAlgorithm.Algorithm.Equal(oidRSAPSS)
 	if len(c.si.SignedAttrs.FullBytes) == 0 {
 		return verifyPub(c.signer.PublicKey, h, pss, d, c.si.Signature)
@@ -299,7 +301,7 @@ type tsResult struct {
 }
 
 // parseTimestamp validates an RFC 3161 token over data (signature value or document byte range).
-func parseTimestamp(token, data []byte) *tsResult {
+func parseTimestamp(token []byte, data ...[]byte) *tsResult {
 	c, err := parseCMS(token)
 	if err != nil {
 		return &tsResult{Err: err}
@@ -320,7 +322,7 @@ func parseTimestamp(token, data []byte) *tsResult {
 		return r
 	}
 	h, ok := hashByOID[ti.MessageImprint.HashAlgorithm.Algorithm.String()]
-	if !ok || !bytes.Equal(digest(h, data), ti.MessageImprint.HashedMessage) {
+	if !ok || !bytes.Equal(digest(h, data...), ti.MessageImprint.HashedMessage) {
 		r.Err = errors.New("znacznik czasu nie dotyczy tych danych (messageImprint niezgodny)")
 	}
 	return r

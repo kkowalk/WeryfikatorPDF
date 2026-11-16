@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/asn1"
+	"slices"
 	"strings"
 	"time"
 
@@ -17,9 +18,10 @@ type pool struct {
 	certs       []*x509.Certificate
 	crls, ocsps [][]byte
 	seen        map[[32]byte]bool
+	budget      int64 // bytes left for decompressing PDF streams
 }
 
-func newPool() *pool { return &pool{seen: map[[32]byte]bool{}} }
+func newPool() *pool { return &pool{seen: map[[32]byte]bool{}, budget: 200 << 20} }
 
 func (p *pool) addCert(c *x509.Certificate) {
 	if h := sha256.Sum256(c.Raw); !p.seen[h] {
@@ -128,6 +130,7 @@ func (e *revEvidence) revoked(S time.Time) {
 func evalCRL(cert, issuer *x509.Certificate, der []byte, S time.Time) *revEvidence {
 	rl, err := x509.ParseRevocationList(der)
 	if err != nil || !bytes.Equal(rl.RawIssuer, cert.RawIssuer) ||
+		issuer.KeyUsage != 0 && issuer.KeyUsage&x509.KeyUsageCRLSign == 0 ||
 		checkSigned(issuer, rl.SignatureAlgorithm, rl.RawTBSRevocationList, rl.Signature) != nil {
 		return nil
 	}
@@ -148,19 +151,15 @@ func evalCRL(cert, issuer *x509.Certificate, der []byte, S time.Time) *revEviden
 		ev.revoked(S)
 		return ev
 	}
-	var delta, idpMismatch bool
+	var delta bool
+	var idpProblem string
 	var expiredOn time.Time
 	for _, x := range rl.Extensions {
 		switch x.Id.String() {
 		case "2.5.29.27":
 			delta = true
-		case "2.5.29.28": // partitioned CRL: must name one of the cert's distribution points
-			idpMismatch = true
-			for _, u := range cert.CRLDistributionPoints {
-				if bytes.Contains(x.Value, []byte(u)) {
-					idpMismatch = false
-				}
-			}
+		case "2.5.29.28":
+			idpProblem = checkIDP(x.Value, cert)
 		case "2.5.29.60": // ExpiredCertsOnCRL
 			asn1.Unmarshal(x.Value, &expiredOn)
 		}
@@ -168,8 +167,8 @@ func evalCRL(cert, issuer *x509.Certificate, der []byte, S time.Time) *revEviden
 	switch {
 	case delta:
 		ev.Note = "delta CRL — brak wpisu nie jest dowodem"
-	case idpMismatch:
-		ev.Note = "CRL częściowa (IDP) nieobejmująca tego certyfikatu"
+	case idpProblem != "":
+		ev.Note = idpProblem + " — brak wpisu nie jest dowodem"
 	case rl.ThisUpdate.Before(S):
 		ev.Note = "CRL wydana przed datą podpisu — nie dowodzi stanu na tę datę"
 	case cert.NotAfter.Before(rl.ThisUpdate) && (expiredOn.IsZero() || expiredOn.After(cert.NotAfter)):
@@ -179,6 +178,48 @@ func evalCRL(cert, issuer *x509.Certificate, der []byte, S time.Time) *revEviden
 		ev.Note = "certyfikat nie figuruje na liście unieważnień wydanej po dacie podpisu"
 	}
 	return ev
+}
+
+// checkIDP returns why a CRL with this IssuingDistributionPoint (RFC 5280 §5.2.5) does not
+// prove cert's status, or "" if it covers cert.
+func checkIDP(der []byte, cert *x509.Certificate) string {
+	var idp struct {
+		DP          asn1.RawValue  `asn1:"optional,tag:0"` // [0] wrapping DistributionPointName (CHOICE → explicit)
+		OnlyUser    bool           `asn1:"optional,tag:1"`
+		OnlyCA      bool           `asn1:"optional,tag:2"`
+		SomeReasons asn1.BitString `asn1:"optional,tag:3"`
+		Indirect    bool           `asn1:"optional,tag:4"`
+		OnlyAttr    bool           `asn1:"optional,tag:5"`
+	}
+	if rest, err := asn1.Unmarshal(der, &idp); err != nil || len(rest) > 0 {
+		return "nieprawidłowe rozszerzenie IssuingDistributionPoint"
+	}
+	switch {
+	case idp.OnlyCA && !cert.IsCA, idp.OnlyUser && cert.IsCA, idp.OnlyAttr:
+		return "CRL obejmuje inny rodzaj certyfikatów (IDP onlyContains…)"
+	case idp.SomeReasons.BitLength > 0:
+		return "CRL obejmuje tylko wybrane powody unieważnienia (IDP onlySomeReasons)"
+	case idp.Indirect:
+		return "CRL pośrednia (IDP indirectCRL) — nieobsługiwana"
+	case len(idp.DP.FullBytes) == 0:
+		return ""
+	}
+	// fullName [0] GeneralNames; URIs are [6] IA5String. nameRelativeToCRLIssuer is not matched.
+	var name asn1.RawValue
+	if _, err := asn1.Unmarshal(idp.DP.Bytes, &name); err == nil && name.Class == asn1.ClassContextSpecific && name.Tag == 0 {
+		for rest := name.Bytes; len(rest) > 0; {
+			var gn asn1.RawValue
+			r, err := asn1.Unmarshal(rest, &gn)
+			if err != nil {
+				break
+			}
+			rest = r
+			if gn.Class == asn1.ClassContextSpecific && gn.Tag == 6 && slices.Contains(cert.CRLDistributionPoints, string(gn.Bytes)) {
+				return ""
+			}
+		}
+	}
+	return "CRL częściowa (IDP) nieobejmująca punktu dystrybucji tego certyfikatu"
 }
 
 var oidArchiveCutoff = asn1.ObjectIdentifier{1, 3, 6, 1, 5, 5, 7, 48, 1, 6}

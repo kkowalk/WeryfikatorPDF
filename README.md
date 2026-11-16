@@ -64,11 +64,14 @@ Ocena na dzień podpisu S:
 1. **Integralność**: skrót zakresu ByteRange musi być zgodny z `messageDigest`, podpis musi dać się
    zweryfikować kluczem certyfikatu, a atrybut `signing-certificate(-v2)` musi wiązać certyfikat z podpisem.
 2. **Data S** jest wybierana według siły dowodowej: kwalifikowany znacznik czasu > niekwalifikowany znacznik
-   czasu (podpisu lub dokumentu) > `signingTime` / `/M` (deklaracja podpisującego) > data podana ręcznie.
-   Gdy data nie jest potwierdzona znacznikiem czasu, wynik „ważny” jest warunkowy.
-3. **Ścieżka certyfikacji** musi prowadzić do usługi z listy zaufanych usług państwa UE
-   ([ETSI TS 119 612](https://www.etsi.org/standards)), a S musi mieścić się w okresie ważności
-   każdego certyfikatu.
+   czasu z TSA powiązanego z listą zaufanych usług > znacznik czasu z niezweryfikowanego TSA, `signingTime` / `/M`
+   (deklaracje) > data podana ręcznie. Gdy data nie jest potwierdzona zaufanym znacznikiem czasu, wynik to
+   „ważny z zastrzeżeniami”.
+3. **Ścieżka certyfikacji** musi prowadzić do usługi typu CA/QC lub CA/PKC, która na dzień S miała
+   pozytywny status na liście zaufanych usług państwa UE ([ETSI TS 119 612](https://www.etsi.org/standards)).
+   Status negatywny daje wynik „nieważny”, brak wpisu na dzień S daje wynik nierozstrzygający. Każdy wystawca
+   musi być urzędem certyfikacji (`cA`, `keyCertSign`, `pathLenConstraint` wg RFC 5280), a S musi mieścić się
+   w okresie ważności każdego certyfikatu.
 4. **Unieważnienie**: źródła w kolejności dane osadzone w PDF (DSS, `adbe-revocationInfoArchival`),
    CRL ([RFC 5280](https://www.rfc-editor.org/rfc/rfc5280)), OCSP
    ([RFC 6960](https://www.rfc-editor.org/rfc/rfc6960)).
@@ -79,12 +82,16 @@ Ocena na dzień podpisu S:
    - Brak wpisu na CRL wydanej po wygaśnięciu certyfikatu daje wynik nierozstrzygający, bo wpis mógł
      zostać usunięty (RFC 5280 §3.3).
 5. **Status kwalifikowany** wynika z QcStatements w certyfikacie oraz statusu CA/QC wystawcy na liście
-   zaufanych usług na dzień S, z uwzględnieniem historii statusów (art. 32 ust. 1 eIDAS).
+   zaufanych usług na dzień S, z uwzględnieniem historii statusów (art. 32 ust. 1 eIDAS) i zakresu
+   `ForeSignatures` / `ForeSeals` usługi.
+6. **Wynik**: „ważny”, „ważny z zastrzeżeniami” (warunki spełnione, ale np. data niepotwierdzona zaufanym
+   znacznikiem czasu, plik zmieniony po podpisaniu albo użycie SHA-1), „nierozstrzygające”, „nieważny”.
 
 ## Ograniczenia
 
 - Podpisy XML list zaufanych usług nie są weryfikowane. Integralność zapewnia HTTPS ze źródeł wskazanych w LOTL.
-- Kwalifikatory usług (`ServiceInformationExtensions`) nie są uwzględniane.
+- Z kwalifikatorów usług (`ServiceInformationExtensions`) uwzględniany jest tylko zakres `ForeSignatures` / `ForeSeals`
+  bieżącego wpisu (bez historii).
 - Nie jest sprawdzane unieważnienie certyfikatów TSA ani delegowanych responderów OCSP.
 - Nie jest analizowane DocMDP. Wykrywane są tylko zmiany dopisane poza zakresem podpisu.
 - Podpis CMS musi być zakodowany w DER (BER nie jest obsługiwany).
@@ -130,10 +137,13 @@ mają już opublikowane wydanie ([warunki](https://signpath.org/terms)).
    - token API dla użytkownika z rolą *submitter* w tej polityce,
    - opcjonalnie aplikacja SignPath dla GitHub, potrzebna do oceny audit logu
      ([dokumentacja](https://docs.signpath.io/trusted-build-systems/github)).
-5. Skonfiguruj GitHub w zakładce Settings → Secrets and variables → Actions:
-   - secret `SIGNPATH_API_TOKEN` (token z kroku 4),
+5. Skonfiguruj GitHub:
+   - secret `SIGNPATH_API_TOKEN` (token z kroku 4) jako **sekret środowiska** `release`
+     (Settings → Environments → `release` → Environment secrets), **nie** jako sekret repozytorium.
+     Dzięki temu token trafia tylko do joba `release`, i to dopiero po zatwierdzeniu przez wymaganego
+     recenzenta. Job `build`, który uruchamia kod projektu, nie ma do niego dostępu,
    - zmienne `SIGNPATH_ORGANIZATION_ID`, `SIGNPATH_PROJECT_SLUG` i `SIGNPATH_SIGNING_POLICY_SLUG`
-     (wartości z panelu SignPath).
+     (wartości z panelu SignPath) w zakładce Settings → Secrets and variables → Actions → Variables.
 6. Wypchnij nowy tag wersji. Workflow wyśle `.exe` do SignPath i poczeka do 2 godzin. Zatwierdź żądanie
    w panelu SignPath, a podpisany plik trafi do Release. Wcześniejszych wydań nie da się podpisać wstecz.
 

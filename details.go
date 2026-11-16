@@ -224,7 +224,7 @@ func cmsDetails(ps pdfSig, c *cmsSig) []kv {
 	dalg := c.si.DigestAlgorithm.Algorithm.String()
 	if h, ok := hashByOID[dalg]; ok {
 		out = append(out, kv{"Algorytm skrótu", h.String() + " (" + dalg + ")"},
-			kv{"Skrót zakresu ByteRange (obliczony)", hex.EncodeToString(digest(h, ps.Signed))})
+			kv{"Skrót zakresu ByteRange (obliczony)", hex.EncodeToString(digest(h, ps.Signed...))})
 	} else {
 		out = append(out, kv{"Algorytm skrótu", dalg})
 	}

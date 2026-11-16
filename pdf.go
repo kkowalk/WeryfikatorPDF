@@ -18,7 +18,7 @@ type pdfSig struct {
 	DER       []byte    // CMS from /Contents (may carry trailing zero padding)
 	SubFilter string    // e.g. ETSI.CAdES.detached, ETSI.RFC3161
 	M         time.Time // /M from the signature dictionary (zero if absent)
-	Signed    []byte    // bytes covered by the signature
+	Signed    [][]byte  // the two byte ranges covered by the signature (views into the file, not copies)
 	End       int64     // offset where the signed revision ends
 }
 
@@ -27,6 +27,10 @@ var (
 	reSubFilter = regexp.MustCompile(`/SubFilter\s*/([A-Za-z0-9.#_-]+)`)
 	reM         = regexp.MustCompile(`/M\s*\((D:[^)]*)\)`)
 )
+
+// maxSigs bounds work on hostile files; findSignatures returns maxSigs+1 entries when exceeded.
+// ponytail: each signature not covering the whole file still saves its signed version (≤ maxSigs × file size on disk).
+const maxSigs = 64
 
 // findSignatures scans raw PDF bytes. The /Contents hex string of a signature
 // is by definition the literal gap between ByteRange segments, so no PDF
@@ -45,21 +49,27 @@ func findSignatures(data []byte) []pdfSig {
 		if seen[br] || a != 0 || b < 2 || c <= b+1 || d < 0 || c+d > n || data[b] != '<' || data[c-1] != '>' {
 			continue
 		}
+		if len(out) == maxSigs {
+			return append(out, pdfSig{})
+		}
 		seen[br] = true
 		der, err := hex.DecodeString(string(bytes.Join(bytes.Fields(data[b+1:c-1]), nil)))
 		if err != nil {
 			continue
 		}
 		s := pdfSig{ByteRange: br, DER: der, End: c + d}
-		s.Signed = append(append([]byte{}, data[:b]...), data[c:c+d]...)
+		s.Signed = [][]byte{data[:b], data[c : c+d]}
 
 		// Signature dictionary text around the gap, without the hex blob.
 		var dict []byte
-		if lo := bytes.LastIndex(data[:min(int64(m[0]), b)], []byte("obj")); lo >= 0 {
-			dict = append(dict, data[lo:b]...)
+		const win = 64 << 10 // dictionary search window, keeps scanning linear
+		to := min(int64(m[0]), b)
+		from0 := max(0, to-win)
+		if lo := bytes.LastIndex(data[from0:to], []byte("obj")); lo >= 0 {
+			dict = append(dict, data[from0+int64(lo):b]...)
 		}
 		from := max(int64(m[1]), c)
-		if hi := bytes.Index(data[from:], []byte("endobj")); hi >= 0 {
+		if hi := bytes.Index(data[from:min(n, from+win)], []byte("endobj")); hi >= 0 {
 			dict = append(dict, data[c:from+int64(hi)]...)
 		}
 		if mm := reSubFilter.FindSubmatch(dict); mm != nil {
@@ -139,7 +149,7 @@ func (p *pool) tryStream(b []byte) {
 		p.harvest(b, 0)
 		return
 	}
-	if len(b) < 2 || b[0] != 0x78 { // not zlib
+	if len(b) < 2 || b[0] != 0x78 || p.budget <= 0 { // not zlib, or decompression budget used up
 		return
 	}
 	zr, err := zlib.NewReader(bytes.NewReader(b))
@@ -150,6 +160,7 @@ func (p *pool) tryStream(b []byte) {
 	if _, err := io.ReadFull(zr, head); err != nil || head[0] != 0x30 {
 		return // not DER: images, fonts, content streams
 	}
-	rest, _ := io.ReadAll(io.LimitReader(zr, 50<<20))
+	rest, _ := io.ReadAll(io.LimitReader(zr, min(50<<20, p.budget)))
+	p.budget -= int64(len(rest))
 	p.harvest(append(head, rest...), 0)
 }

@@ -5,6 +5,7 @@ package main
 
 import (
 	"bufio"
+	"crypto"
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/asn1"
@@ -34,7 +35,7 @@ func (c check) Label() string {
 type dateCand struct {
 	T                    time.Time
 	Shown, Source, Level string
-	rank                 int // 1 qualified sig TS, 2 qualified doc TS, 3/4 non-qualified, 5 signingTime, 6 /M, 99 manual
+	rank                 int // 1/2 qualified sig/doc TS, 3/4 trusted TS, 5/6 unverified TS, 7 signingTime, 8 /M, 99 manual; >4 = unconfirmed
 }
 
 type certRow struct {
@@ -89,7 +90,7 @@ type env struct {
 func newEnv(out string, offline bool) *env {
 	e := &env{logf: func(string, ...any) {}}
 	e.ev = &evidence{dir: out, saved: map[[32]byte]string{}}
-	e.net = &netFetcher{client: &http.Client{Timeout: 60 * time.Second}, ev: e.ev, cache: map[string]fetched{}, offline: offline}
+	e.net = &netFetcher{client: &http.Client{Timeout: 60 * time.Second, CheckRedirect: checkRedirect}, ev: e.ev, cache: map[string]fetched{}, offline: offline}
 	e.trust = &trust{net: e.net, loaded: map[string]bool{}}
 	return e
 }
@@ -108,7 +109,7 @@ func defaultOut(files []string, firstArg string) string {
 // verifyAll analyses files and writes all reports into out. progress(i, nil) is called
 // before file i, progress(i, fr) after it.
 func (e *env) verifyAll(files []string, out string, progress func(i int, fr *fileReport)) ([]*fileReport, error) {
-	if err := os.MkdirAll(out, 0o755); err != nil {
+	if err := os.MkdirAll(out, 0o700); err != nil {
 		return nil, fmt.Errorf("nie można utworzyć katalogu raportu: %w", err)
 	}
 	var reports []*fileReport
@@ -245,6 +246,10 @@ func (e *env) analyzeFile(p string) *fileReport {
 		fr.Error = "Nie znaleziono podpisów PDF (brak poprawnych /ByteRange)."
 		return fr
 	}
+	if len(sigs) > maxSigs {
+		fr.Error = fmt.Sprintf("Plik zawiera więcej niż %d podpisów — analiza przerwana (możliwy plik złośliwy).", maxSigs)
+		return fr
+	}
 	pl := newPool()
 	pl.harvestStreams(data)
 	type item struct {
@@ -257,7 +262,7 @@ func (e *env) analyzeFile(p string) *fileReport {
 	for i, ps := range sigs {
 		it := item{ps: ps}
 		if ps.SubFilter == "ETSI.RFC3161" {
-			it.ts = parseTimestamp(ps.DER, ps.Signed)
+			it.ts = parseTimestamp(ps.DER, ps.Signed...)
 			for _, c := range it.ts.Certs {
 				pl.addCert(c)
 			}
@@ -307,16 +312,17 @@ func (fr *fileReport) finish() {
 	if fr.Error != "" {
 		return
 	}
-	rank := map[string]int{"ok": 0, "unknown": 1, "fail": 2}
 	worst := ""
 	for _, s := range fr.Sigs {
-		if s.Kind == "Podpis" && (worst == "" || rank[s.VerdictClass] > rank[worst]) {
+		if s.Kind == "Podpis" && (worst == "" || severity[s.VerdictClass] > severity[worst]) {
 			worst = s.VerdictClass
 		}
 	}
 	switch worst {
 	case "ok":
 		fr.Verdict, fr.VerdictClass = "WSZYSTKIE PODPISY WAŻNE NA DZIEŃ PODPISANIA", "ok"
+	case "warn":
+		fr.Verdict, fr.VerdictClass = "WSZYSTKIE PODPISY WAŻNE NA DZIEŃ PODPISANIA — Z ZASTRZEŻENIAMI", "warn"
 	case "fail":
 		fr.Verdict, fr.VerdictClass = "CO NAJMNIEJ JEDEN PODPIS NIEWAŻNY", "fail"
 	case "":
@@ -335,26 +341,46 @@ func (s *sigReport) coverage(ps pdfSig, data []byte, ev *evidence) {
 		"Treść bieżącej wersji może różnić się od podpisanej — rozstrzyga zapisana wersja podpisana.")
 }
 
-// evalTS validates a timestamp's TSA and reports whether it is qualified at genTime.
-func (e *env) evalTS(ts *tsResult, pl *pool) (level string, qualified bool, err error) {
+// evalTS validates a timestamp and classifies its TSA: tier 0 qualified, 1 trusted (chained to an
+// EU TL service with a positive status, timeStamping EKU), 2 unverified — accepted, but only as a claim.
+func (e *env) evalTS(ts *tsResult, pl *pool) (level string, tier int, err error) {
 	if ts.Err != nil {
-		return "", false, ts.Err
+		return "", 0, ts.Err
 	}
 	if ts.GenTime.Before(ts.TSA.NotBefore) || ts.GenTime.After(ts.TSA.NotAfter) {
-		return "", false, errors.New("certyfikat TSA nie był ważny w chwili wystawienia znacznika")
+		return "", 0, errors.New("certyfikat TSA nie był ważny w chwili wystawienia znacznika")
 	}
 	e.trust.load(country(ts.TSA.Subject.Country))
 	e.trust.load(country(ts.TSA.Issuer.Country))
 	// ponytail: TSA certificate revocation is not checked; qualified status comes from the TL.
-	_, anchor := e.trust.chain(ts.TSA, slices.Concat(ts.Certs, pl.certs))
-	for _, a := range anchor {
-		st, ok := a.at(ts.GenTime)
-		if ok && positive(st.Status) && (strings.HasSuffix(st.Type, "/TSA/QTST") ||
-			(strings.HasSuffix(st.Type, "/TSA") && path.Base(st.Status) == "accredited")) {
-			return fmt.Sprintf("kwalifikowany znacznik czasu — %s / %s (%s), status %s", a.TSP, a.Service, a.Country, path.Base(st.Status)), true, nil
+	_, anchor, cerr := e.trust.chain(ts.TSA, slices.Concat(ts.Certs, pl.certs))
+	why := "usługa nie miała w chwili znacznika pozytywnego statusu na liście zaufanych usług"
+	switch {
+	case !slices.Contains(ts.TSA.ExtKeyUsage, x509.ExtKeyUsageTimeStamping):
+		why = "certyfikat bez rozszerzenia extKeyUsage timeStamping"
+	case cerr != nil:
+		why = cerr.Error()
+	case anchor == nil:
+		why = "brak powiązania z listą zaufanych usług UE"
+	default:
+		var trusted *tlEntry
+		for _, a := range anchor {
+			st, ok := a.at(ts.GenTime)
+			if !ok || !positive(st.Status) {
+				continue
+			}
+			if strings.HasSuffix(st.Type, "/TSA/QTST") || (strings.HasSuffix(st.Type, "/TSA") && path.Base(st.Status) == "accredited") {
+				return fmt.Sprintf("kwalifikowany znacznik czasu — %s / %s (%s), status %s", a.TSP, a.Service, a.Country, path.Base(st.Status)), 0, nil
+			}
+			if trusted == nil {
+				trusted = a
+			}
+		}
+		if trusted != nil {
+			return fmt.Sprintf("niekwalifikowany znacznik czasu — TSA %s powiązany z usługą %s / %s (%s)", cn(ts.TSA), trusted.TSP, trusted.Service, trusted.Country), 1, nil
 		}
 	}
-	return "niekwalifikowany znacznik czasu (poprawny kryptograficznie) — TSA: " + cn(ts.TSA), false, nil
+	return "znacznik czasu z niezweryfikowanego TSA (" + cn(ts.TSA) + ": " + why + ") — poprawny kryptograficznie, ale siła dowodowa jak deklaracja podpisującego", 2, nil
 }
 
 func (e *env) evalDocTS(n int, ps pdfSig, ts *tsResult, pl *pool, data []byte) *sigReport {
@@ -364,14 +390,18 @@ func (e *env) evalDocTS(n int, ps pdfSig, ts *tsResult, pl *pool, data []byte) *
 	}
 	s.coverage(ps, data, e.ev)
 	s.Date, s.DateSource = fmtTime(ts.GenTime), "TSTInfo.genTime"
-	if level, _, err := e.evalTS(ts, pl); err != nil {
-		s.add("Znacznik czasu", "fail", err.Error())
+	cls := "ok"
+	if level, tier, err := e.evalTS(ts, pl); err != nil {
+		cls = "fail"
+		s.add("Znacznik czasu", cls, err.Error())
+	} else if s.DateLevel = level; tier == 2 {
+		cls = "warn"
+		s.add("Znacznik czasu", cls, "Token RFC 3161 poprawny kryptograficznie i obejmuje dokument w zakresie ByteRange, ale wystawca tokena (TSA) nie został zweryfikowany — czas "+s.Date+" jest jego deklaracją.")
 	} else {
-		s.DateLevel = level
-		s.add("Znacznik czasu", "ok", "Token RFC 3161 poprawny i obejmuje dokument w zakresie ByteRange — dowód, że ta wersja dokumentu istniała najpóźniej "+s.Date+".")
+		s.add("Znacznik czasu", cls, "Token RFC 3161 poprawny i obejmuje dokument w zakresie ByteRange — dowód, że ta wersja dokumentu istniała najpóźniej "+s.Date+".")
 	}
-	_, cls := verdict(s.Checks)
-	s.Verdict, s.VerdictClass = map[string]string{"ok": "ZNACZNIK CZASU POPRAWNY", "fail": "ZNACZNIK CZASU NIEPOPRAWNY"}[cls], cls
+	// verdict follows the token only: later incremental updates are normal for document timestamps
+	s.Verdict, s.VerdictClass = map[string]string{"ok": "ZNACZNIK CZASU POPRAWNY", "warn": "ZNACZNIK CZASU NIEZWERYFIKOWANY", "fail": "ZNACZNIK CZASU NIEPOPRAWNY"}[cls], cls
 	return s
 }
 
@@ -380,14 +410,14 @@ func (e *env) evalSig(n int, fname string, ps pdfSig, c *cmsSig, perr error, doc
 	s.coverage(ps, data, e.ev)
 	if perr != nil {
 		s.add("Struktura podpisu", "fail", perr.Error())
-		s.finish(dateCand{})
+		s.finish()
 		return s
 	}
 	signer := c.signer
 	s.Signer, s.SignerDN = cn(signer), signer.Subject.String()
 	s.CMS = cmsDetails(ps, c)
 
-	if err := c.verify(ps.Signed); err != nil {
+	if err := c.verify(ps.Signed...); err != nil {
 		s.add("Integralność i podpis kryptograficzny", "fail", err.Error())
 	} else {
 		s.add("Integralność i podpis kryptograficzny", "ok", "Skrót zakresu ByteRange zgodny z messageDigest; podpis zweryfikowany kluczem publicznym certyfikatu podpisującego.")
@@ -399,6 +429,11 @@ func (e *env) evalSig(n int, fname string, ps pdfSig, c *cmsSig, perr error, doc
 	} else {
 		s.add("Powiązanie certyfikatu z podpisem", "ok", "Skrót certyfikatu w atrybucie signing-certificate zgodny.")
 	}
+	_, essV1 := c.signed[oidSigningCertV1]
+	_, essV2 := c.signed[oidSigningCertV2]
+	if hashByOID[c.si.DigestAlgorithm.Algorithm.String()] == crypto.SHA1 || essV1 && !essV2 {
+		s.add("Algorytm skrótu", "warn", "Podpis lub atrybut signing-certificate używa SHA-1 — algorytmu uznanego za kryptograficznie słaby (praktyczne ataki kolizyjne). Siła dowodowa podpisu jest obniżona.")
+	}
 	if ku := signer.KeyUsage; ku != 0 && ku&(x509.KeyUsageDigitalSignature|x509.KeyUsageContentCommitment) == 0 {
 		s.add("Przeznaczenie klucza", "fail", "keyUsage certyfikatu nie dopuszcza składania podpisu.")
 	}
@@ -408,25 +443,25 @@ func (e *env) evalSig(n int, fname string, ps pdfSig, c *cmsSig, perr error, doc
 	var sigTS time.Time
 	if v, ok := c.unsigned[oidSigTimestamp]; ok {
 		ts := parseTimestamp(firstValue(v), c.si.Signature)
-		if level, q, err := e.evalTS(ts, pl); err != nil {
+		if level, tier, err := e.evalTS(ts, pl); err != nil {
 			s.add("Znacznik czasu podpisu", "warn", "Pominięty: "+err.Error())
 		} else {
-			cands = append(cands, dateCand{T: ts.GenTime, Source: "znacznik czasu podpisu — podpis istniał najpóźniej w tej chwili", Level: level, rank: map[bool]int{true: 1, false: 3}[q]})
+			cands = append(cands, dateCand{T: ts.GenTime, Source: "znacznik czasu podpisu — podpis istniał najpóźniej w tej chwili", Level: level, rank: 1 + 2*tier})
 			sigTS = ts.GenTime
 		}
 	}
 	for _, d := range docTS {
-		if level, q, err := e.evalTS(d, pl); err == nil {
-			cands = append(cands, dateCand{T: d.GenTime, Source: "znacznik czasu dokumentu obejmujący podpis — podpis istniał najpóźniej w tej chwili", Level: level, rank: map[bool]int{true: 2, false: 4}[q]})
+		if level, tier, err := e.evalTS(d, pl); err == nil {
+			cands = append(cands, dateCand{T: d.GenTime, Source: "znacznik czasu dokumentu obejmujący podpis — podpis istniał najpóźniej w tej chwili", Level: level, rank: 2 + 2*tier})
 			break
 		}
 	}
 	const claimed = "deklaracja podpisującego (zegar komputera podpisującego) — bez dowodu kryptograficznego"
 	if t, ok := c.signingTime(); ok {
-		cands = append(cands, dateCand{T: t, Source: "atrybut signingTime w podpisie", Level: claimed, rank: 5})
+		cands = append(cands, dateCand{T: t, Source: "atrybut signingTime w podpisie", Level: claimed, rank: 7})
 	}
 	if !ps.M.IsZero() {
-		cands = append(cands, dateCand{T: ps.M, Source: "pole /M słownika podpisu PDF", Level: claimed, rank: 6})
+		cands = append(cands, dateCand{T: ps.M, Source: "pole /M słownika podpisu PDF", Level: claimed, rank: 8})
 	}
 	sort.SliceStable(cands, func(i, j int) bool { return cands[i].rank < cands[j].rank })
 	for i := range cands {
@@ -437,8 +472,12 @@ func (e *env) evalSig(n int, fname string, ps pdfSig, c *cmsSig, perr error, doc
 	d := e.pickDate(fname, n, s.Signer, cands)
 	if d.T.IsZero() {
 		s.add("Data podpisania", "unknown", "Brak daty w podpisie i nie podano jej ręcznie.")
-		s.finish(d)
+		s.finish()
 		return s
+	}
+	if d.rank > 4 {
+		s.add("Data podpisu", "warn", "Przyjęta data ("+d.Source+") nie jest potwierdzona zaufanym znacznikiem czasu. "+
+			"Wynik zakłada, że podpis złożono w tej dacie — należy to potwierdzić z innych źródeł.")
 	}
 	S := d.T
 	s.at = S
@@ -453,7 +492,7 @@ func (e *env) evalSig(n int, fname string, ps pdfSig, c *cmsSig, perr error, doc
 		s.add("Spójność daty", "warn", "Przyjęta data jest późniejsza niż znacznik czasu podpisu ("+fmtTime(sigTS)+"), a podpis istniał już w chwili znacznika.")
 	}
 
-	chain, anchor := e.trust.chain(signer, pl.certs)
+	chain, anchor, cerr := e.trust.chain(signer, pl.certs)
 	for i, ct := range chain {
 		role := "pośredni"
 		switch {
@@ -477,14 +516,21 @@ func (e *env) evalSig(n int, fname string, ps pdfSig, c *cmsSig, perr error, doc
 			s.add("Okres ważności: "+cn(ct), "fail", "Certyfikat ważny "+fmtTime(ct.NotBefore)+" — "+fmtTime(ct.NotAfter)+"; nie obejmuje daty podpisu.")
 		}
 	}
+	if cerr != nil {
+		s.add("Ścieżka certyfikacji", "fail", cerr.Error())
+		s.Qualified = "NIE — nieprawidłowa ścieżka certyfikacji"
+		s.finish()
+		return s
+	}
 	if anchor == nil {
 		s.add("Kotwica zaufania (lista zaufanych usług UE)", "unknown",
 			"Nie zbudowano ścieżki certyfikacji do usługi z listy zaufanych usług państwa UE. "+strings.Join(e.trust.Errors, " "))
 		s.Qualified = "NIEUSTALONY — brak powiązania z listą zaufanych usług"
-		s.finish(d)
+		s.finish()
 		return s
 	}
-	s.add("Kotwica zaufania (lista zaufanych usług UE)", "ok", fmt.Sprintf("%s — %s (%s)", anchor[0].TSP, anchor[0].Service, anchor[0].Country))
+	ast, adetail := anchorState(anchor, S)
+	s.add("Kotwica zaufania (lista zaufanych usług UE)", ast, adetail)
 	for _, a := range anchor {
 		row := tlRow{Country: a.Country, TSP: a.TSP, Service: a.Service, Type: "—", Status: "brak wpisu na tę datę", File: a.File, URL: a.URL}
 		if st, ok := a.at(S); ok {
@@ -493,6 +539,11 @@ func (e *env) evalSig(n int, fname string, ps pdfSig, c *cmsSig, perr error, doc
 			s.event(st.Start, "Usługa „"+a.Service+"” ("+row.Type+") ze statusem "+path.Base(st.Status)+" na liście zaufanych usług", a.URL, "")
 		}
 		s.TL = append(s.TL, row)
+	}
+	if ast != "ok" {
+		s.Qualified = map[string]string{"fail": "NIE", "unknown": "NIEUSTALONY"}[ast] + " — wystawca bez pozytywnego statusu usługi CA na liście zaufanych usług w dniu podpisu"
+		s.finish()
+		return s
 	}
 
 	for i := 0; i < len(chain)-1; i++ {
@@ -534,16 +585,16 @@ func (e *env) evalSig(n int, fname string, ps pdfSig, c *cmsSig, perr error, doc
 		}
 	}
 	s.Qualified = qualification(signer, anchor, S)
-	s.finish(d)
+	s.finish()
 	return s
 }
 
-func (s *sigReport) finish(d dateCand) {
+func (s *sigReport) finish() {
 	if len(s.Timeline) > 0 {
 		s.event(time.Now(), "Sporządzenie raportu", tool(), evEvidence)
 		s.sortTimeline()
 	}
-	_, cls := verdict(s.Checks)
+	cls := verdict(s.Checks)
 	s.VerdictClass = cls
 	switch cls {
 	case "fail":
@@ -553,25 +604,24 @@ func (s *sigReport) finish(d dateCand) {
 		}
 	case "unknown":
 		s.Verdict = "NIEROZSTRZYGNIĘTE"
+	case "warn":
+		s.Verdict = "PODPIS WAŻNY NA DZIEŃ " + s.Date + " — Z ZASTRZEŻENIAMI (zob. kontrole oznaczone UWAGA)"
 	default:
 		s.Verdict = "PODPIS WAŻNY NA DZIEŃ " + s.Date
-		if d.rank > 4 {
-			s.Verdict += " — pod warunkiem, że podpis złożono w tej dacie (data niepotwierdzona znacznikiem czasu)"
-		}
 	}
 }
 
-func verdict(cs []check) (string, string) {
+var severity = map[string]int{"ok": 0, "warn": 1, "unknown": 2, "fail": 3}
+
+// verdict returns the most severe check state.
+func verdict(cs []check) string {
 	cls := "ok"
 	for _, c := range cs {
-		switch c.State {
-		case "fail":
-			return "fail", "fail"
-		case "unknown":
-			cls = "unknown"
+		if severity[c.State] > severity[cls] {
+			cls = c.State
 		}
 	}
-	return cls, cls
+	return cls
 }
 
 func qualification(signer *x509.Certificate, anchor []*tlEntry, S time.Time) string {
@@ -600,13 +650,14 @@ func qualification(signer *x509.Certificate, anchor []*tlEntry, S time.Time) str
 			}
 		}
 	}
-	caQC := false
+	caQC, scope := false, false
 	for _, a := range anchor {
 		if st, ok := a.at(S); ok && positive(st.Status) && strings.HasSuffix(st.Type, "/CA/QC") {
 			caQC = true
+			scope = scope || a.allows(seal)
 		}
 	}
-	const note = " (kwalifikatory z listy zaufanych usług nie są uwzględniane)"
+	const note = " (z kwalifikatorów listy zaufanych usług uwzględniono tylko ForeSignatures/ForeSeals)"
 	q, adv := "kwalifikowany podpis elektroniczny", "zaawansowany podpis elektroniczny"
 	if seal {
 		q, adv = "kwalifikowana pieczęć elektroniczna", "zaawansowana pieczęć elektroniczna"
@@ -616,6 +667,8 @@ func qualification(signer *x509.Certificate, anchor []*tlEntry, S time.Time) str
 		return "NIE — certyfikat nie deklaruje statusu kwalifikowanego (brak QcCompliance)"
 	case !caQC:
 		return "NIE — wystawca nie miał na dzień podpisu statusu kwalifikowanego (CA/QC) na liście zaufanych usług"
+	case !scope:
+		return "NIE — usługa wystawcy (CA/QC) nie obejmuje " + map[bool]string{false: "podpisów (brak ForeSignatures)", true: "pieczęci (brak ForeSeals)"}[seal] + ", np. tylko certyfikaty witryn"
 	case sscd:
 		return "TAK — " + q + ": certyfikat kwalifikowany wydany przez kwalifikowanego dostawcę + deklaracja QSCD" + note
 	}
