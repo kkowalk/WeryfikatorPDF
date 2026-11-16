@@ -32,6 +32,9 @@ var (
 // ponytail: each signature not covering the whole file still saves its signed version (≤ maxSigs × file size on disk).
 const maxSigs = 64
 
+// maxContents bounds one decoded /Contents (CMS); real ones, even with embedded LTV data, are far below 1 MB.
+const maxContents = 16 << 20
+
 // findSignatures scans raw PDF bytes. The /Contents hex string of a signature
 // is by definition the literal gap between ByteRange segments, so no PDF
 // object parser is needed.
@@ -53,9 +56,12 @@ func findSignatures(data []byte) []pdfSig {
 			return append(out, pdfSig{})
 		}
 		seen[br] = true
-		der, err := hex.DecodeString(string(bytes.Join(bytes.Fields(data[b+1:c-1]), nil)))
-		if err != nil {
-			continue
+		var der []byte // not decoded when /Contents exceeds maxContents; analyzeFile rejects the file
+		if c-b-2 <= 2*maxContents {
+			var err error
+			if der, err = hex.DecodeString(string(bytes.Join(bytes.Fields(data[b+1:c-1]), nil))); err != nil {
+				continue
+			}
 		}
 		s := pdfSig{ByteRange: br, DER: der, End: c + d}
 		s.Signed = [][]byte{data[:b], data[c : c+d]}

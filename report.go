@@ -41,7 +41,7 @@ Kryteria: art. 32 ust. 1 rozporządzenia eIDAS (UE) nr 910/2014; utrata ważnoś
 (<a href="https://eur-lex.europa.eu/eli/reg/2014/910/oj">EUR-Lex</a>); procedura walidacji wzorowana na ETSI EN 319 102-1; listy zaufanych usług wg ETSI TS 119 612; CRL wg RFC 5280; OCSP wg RFC 6960.</li>
 <li>Siła dowodowa daty: kwalifikowany znacznik czasu &gt; niekwalifikowany znacznik czasu z TSA powiązanego z listą zaufanych usług &gt;
 znacznik czasu z niezweryfikowanego TSA, deklaracja podpisującego (signingTime, /M) i data podana ręcznie.
-Znacznik czasu dowodzi, że podpis istniał <i>najpóźniej</i> w chwili znacznika. Gdy data nie jest potwierdzona zaufanym znacznikiem czasu,
+Znacznik czasu dowodzi, że podpis istniał <i>najpóźniej</i> w chwili znacznika. Gdy data nie jest potwierdzona kwalifikowanym znacznikiem czasu (art. 41 ust. 2 eIDAS),
 wynik „ważny” jest wydawany <b>z zastrzeżeniem</b> — zakłada, że podpis złożono w przyjętej dacie, co użytkownik może potwierdzić z innych źródeł.</li>
 <li>Wynik „ważny” wymaga, aby na przyjętą datę: każdy certyfikat ścieżki był w okresie ważności i nieunieważniony, każdy wystawca był urzędem certyfikacji
 (cA, keyCertSign, pathLenConstraint — RFC 5280), a usługa wystawcy na liście zaufanych usług była typu CA/QC lub CA/PKC ze statusem pozytywnym.

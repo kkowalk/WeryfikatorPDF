@@ -65,7 +65,7 @@ Ocena na dzień podpisu S:
    zweryfikować kluczem certyfikatu, a atrybut `signing-certificate(-v2)` musi wiązać certyfikat z podpisem.
 2. **Data S** jest wybierana według siły dowodowej: kwalifikowany znacznik czasu > niekwalifikowany znacznik
    czasu z TSA powiązanego z listą zaufanych usług > znacznik czasu z niezweryfikowanego TSA, `signingTime` / `/M`
-   (deklaracje) > data podana ręcznie. Gdy data nie jest potwierdzona zaufanym znacznikiem czasu, wynik to
+   (deklaracje) > data podana ręcznie. Gdy data nie jest potwierdzona kwalifikowanym znacznikiem czasu (art. 41 ust. 2 eIDAS), wynik to
    „ważny z zastrzeżeniami”.
 3. **Ścieżka certyfikacji** musi prowadzić do usługi typu CA/QC lub CA/PKC, która na dzień S miała
    pozytywny status na liście zaufanych usług państwa UE ([ETSI TS 119 612](https://www.etsi.org/standards)).
@@ -84,7 +84,7 @@ Ocena na dzień podpisu S:
 5. **Status kwalifikowany** wynika z QcStatements w certyfikacie oraz statusu CA/QC wystawcy na liście
    zaufanych usług na dzień S, z uwzględnieniem historii statusów (art. 32 ust. 1 eIDAS) i zakresu
    `ForeSignatures` / `ForeSeals` usługi.
-6. **Wynik**: „ważny”, „ważny z zastrzeżeniami” (warunki spełnione, ale np. data niepotwierdzona zaufanym
+6. **Wynik**: „ważny”, „ważny z zastrzeżeniami” (warunki spełnione, ale np. data niepotwierdzona kwalifikowanym
    znacznikiem czasu, plik zmieniony po podpisaniu albo użycie SHA-1), „nierozstrzygające”, „nieważny”.
 
 ## Ograniczenia
@@ -107,11 +107,68 @@ go test ./...
 CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -ldflags "-s -w -X main.version=0.1.0" -o weryfikator-podpisow.exe .
 ```
 
-Wydanie: wypchnięcie tagu `v*` (np. `git tag -a v0.1.1 -m v0.1.1 && git push origin v0.1.1`) uruchamia
-[workflow release](.github/workflows/release.yml). Workflow wykonuje testy, buduje `.exe` z metadanymi wersji,
-podpisuje go (jeśli podpis jest skonfigurowany), wylicza `SHA256SUMS` i tworzy GitHub Release.
+### Wydanie (workflow release)
+
+Wypchnięcie tagu `v*` (np. `git tag -a v0.1.1 -m v0.1.1 && git push origin v0.1.1`) uruchamia
+[workflow release](.github/workflows/release.yml). Tagi `v*` może tworzyć tylko administrator repozytorium
+(ruleset `release-tags`), a istniejących tagów nie da się przesunąć, usunąć ani nadpisać.
+
+Workflow składa się z dwóch jobów:
+
+1. **`build`**: uruchamia kod projektu, więc dostaje tylko prawo odczytu repozytorium, bez sekretów i bez tokenu OIDC.
+   - pobiera kod z otagowanego commita,
+   - instaluje Go w wersji z `go.mod` bez cache,
+   - uruchamia `go test ./...`,
+   - wpisuje do `.exe` metadane PE (wersja z tagu) narzędziem `go-winres`,
+   - buduje statyczny `.exe` (`CGO_ENABLED=0`, `-trimpath`),
+   - zapisuje `.exe` jako artefakt przebiegu `unsigned`.
+2. **`release`**: nie uruchamia kodu projektu. Startuje dopiero po ręcznym zatwierdzeniu w środowisku
+   `release` (wymagany recenzent).
+   - pobiera artefakt,
+   - podpisuje go przez SignPath, jeśli podpis jest skonfigurowany (procedura poniżej),
+   - wylicza `SHA256SUMS`,
+   - tworzy atestację pochodzenia builda,
+   - publikuje GitHub Release z `.exe` i `SHA256SUMS`.
+
+Wszystkie akcje GitHub są przypięte do SHA commita, nie do tagu wersji.
 
 Niepodpisany `.exe` może zostać zatrzymany przez SmartScreen lub AppLocker.
+
+### Atestacja pochodzenia builda
+
+Atestacja to podpisane oświadczenie w formacie [SLSA Build Provenance](https://slsa.dev/spec/v1.0/provenance).
+Stwierdza, że plik o danym skrócie SHA-256 zbudował workflow `release.yml` z repozytorium
+`kkowalk/WeryfikatorPDF`, z konkretnego commita i tagu, na runnerze hostowanym przez GitHub.
+
+Podpis nie używa żadnego klucza autora:
+1. Job dostaje od GitHuba token OIDC opisujący repozytorium, workflow i commit.
+2. [Sigstore](https://docs.sigstore.dev/) wydaje na jego podstawie certyfikat ważny kilka minut.
+3. Wpis trafia do publicznego, niezmienialnego rejestru przejrzystości (Rekor), więc atestację da się
+   zweryfikować także po wygaśnięciu certyfikatu.
+
+Szczegóły: [GitHub Docs — Artifact attestations](https://docs.github.com/en/actions/security-for-github-actions/using-artifact-attestations/using-artifact-attestations-to-establish-provenance-for-builds).
+
+Co dowodzi atestacja:
+- plik powstał z konkretnego, publicznego commita tego repozytorium,
+- zbudował go ten workflow na infrastrukturze GitHuba,
+- plik nie został podmieniony po zbudowaniu.
+
+Czego atestacja nie dowodzi:
+- że kod jest wolny od błędów,
+- nie zastępuje podpisu Authenticode, bo Windows jej nie sprawdza i nie usuwa ostrzeżenia SmartScreen.
+
+### Weryfikacja pobranego pliku
+
+1. **Atestacja** (wymaga [GitHub CLI](https://cli.github.com/)):
+   ```
+   gh attestation verify weryfikator-podpisow.exe --repo kkowalk/WeryfikatorPDF
+   ```
+   Wynik `Verification succeeded!` oznacza zgodność pliku z atestacją z tego repozytorium. Polecenie wypisuje też
+   commit i workflow, z których plik pochodzi.
+2. **Suma kontrolna**: `Get-FileHash .\weryfikator-podpisow.exe` (PowerShell) i porównanie z `SHA256SUMS`.
+   Suma leży w tym samym Release co plik, więc chroni tylko przed uszkodzeniem przy pobieraniu, a nie
+   przed podmianą. Przed podmianą chroni atestacja.
+3. **Podpis Authenticode** (gdy wydania będą podpisywane): Właściwości pliku → Podpisy cyfrowe.
 
 ## Podpisywanie wydań — procedura (SignPath Foundation)
 

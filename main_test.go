@@ -14,6 +14,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"golang.org/x/crypto/ocsp"
 )
 
 var S = time.Date(2024, 3, 5, 13, 22, 10, 0, time.UTC)
@@ -222,6 +224,7 @@ func TestAnchorState(t *testing.T) {
 		{"CA/QC", "withdrawn", S.AddDate(0, -1, 0), "fail"},
 		{"CA/QC", "granted", S.AddDate(0, 1, 0), "unknown"}, // listed only after S
 		{"TSA/QTST", "granted", S.AddDate(-1, 0, 0), "unknown"},
+		{"TSA/QTST", "withdrawn", S.AddDate(0, -1, 0), "unknown"}, // negative non-CA service is not a verdict on the issuer
 	} {
 		if got, _ := anchorState(tlWith(ca, c.typ, c.status, c.start).entries, S); got != c.want {
 			t.Errorf("%s %s %v: got %s, want %s", c.typ, c.status, c.start, got, c.want)
@@ -277,5 +280,63 @@ func TestCheckIDP(t *testing.T) {
 	}
 	if checkIDP(idp("http://ca.example/crl1.crl", true), cert) == "" {
 		t.Error("onlyContainsCACerts CRL accepted for an end-entity certificate")
+	}
+}
+
+func TestOCSPDelegateNeedsOCSPSigning(t *testing.T) {
+	ca, leaf, caKey, leafKey := pki(t, S.AddDate(1, 0, 0))
+	resp := func(responder *x509.Certificate, key *ecdsa.PrivateKey, embed bool) *revEvidence {
+		tpl := ocsp.Response{Status: ocsp.Good, SerialNumber: leaf.SerialNumber, ThisUpdate: S.AddDate(0, 0, 1), NextUpdate: S.AddDate(0, 0, 8)}
+		if embed {
+			tpl.Certificate = responder
+		}
+		der, err := ocsp.CreateResponse(ca, responder, tpl, key) // ProducedAt = now
+		if err != nil {
+			t.Fatal(err)
+		}
+		return evalOCSP(leaf, ca, der, S)
+	}
+	delegate := func(eku []x509.ExtKeyUsage, notAfter time.Time) (*x509.Certificate, *ecdsa.PrivateKey) {
+		return issue(t, &x509.Certificate{SerialNumber: big.NewInt(30), Subject: pkix.Name{CommonName: "OCSP"},
+			NotBefore: S.AddDate(-1, 0, 0), NotAfter: notAfter, ExtKeyUsage: eku}, ca, caKey)
+	}
+	if ev := resp(ca, caKey, false); ev == nil || ev.Status != revGood {
+		t.Errorf("response signed by the CA rejected: %+v", ev)
+	}
+	ok, okKey := delegate([]x509.ExtKeyUsage{x509.ExtKeyUsageOCSPSigning}, time.Now().AddDate(1, 0, 0))
+	if ev := resp(ok, okKey, true); ev == nil || ev.Status != revGood {
+		t.Errorf("authorised delegated responder rejected: %+v", ev)
+	}
+	if resp(leaf, leafKey, true) != nil {
+		t.Error("checked certificate accepted as its own OCSP responder")
+	}
+	other, otherKey := delegate(nil, time.Now().AddDate(1, 0, 0))
+	if resp(other, otherKey, true) != nil {
+		t.Error("responder without id-kp-OCSPSigning accepted")
+	}
+	expired, expiredKey := delegate([]x509.ExtKeyUsage{x509.ExtKeyUsageOCSPSigning}, S.AddDate(1, 0, 0))
+	if resp(expired, expiredKey, true) != nil {
+		t.Error("responder certificate expired at producedAt accepted")
+	}
+}
+
+func TestIndirectCRLIsNoEvidence(t *testing.T) {
+	ca, leaf, caKey, _ := pki(t, S.AddDate(1, 0, 0))
+	crl := func(ext []pkix.Extension) *revEvidence {
+		der, err := x509.CreateRevocationList(rand.Reader, &x509.RevocationList{Number: big.NewInt(1), ThisUpdate: S.AddDate(0, 1, 0),
+			NextUpdate: S.AddDate(0, 2, 0), ExtraExtensions: ext,
+			RevokedCertificateEntries: []x509.RevocationListEntry{{SerialNumber: leaf.SerialNumber, RevocationTime: S.AddDate(0, 0, -1)}}}, ca, caKey)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return evalCRL(leaf, ca, der, S)
+	}
+	if ev := crl(nil); ev == nil || ev.Status != revRevoked {
+		t.Fatalf("direct CRL entry ignored: %+v", ev)
+	}
+	// IssuingDistributionPoint { indirectCRL [4] TRUE }: the entry may concern another issuer's certificate
+	idp := pkix.Extension{Id: asn1.ObjectIdentifier{2, 5, 29, 28}, Critical: true, Value: []byte{0x30, 0x03, 0x84, 0x01, 0xff}}
+	if ev := crl([]pkix.Extension{idp}); ev == nil || ev.Status != revUnknown {
+		t.Errorf("indirect CRL entry treated as evidence: %+v", ev)
 	}
 }

@@ -35,7 +35,7 @@ func (c check) Label() string {
 type dateCand struct {
 	T                    time.Time
 	Shown, Source, Level string
-	rank                 int // 1/2 qualified sig/doc TS, 3/4 trusted TS, 5/6 unverified TS, 7 signingTime, 8 /M, 99 manual; >4 = unconfirmed
+	rank                 int // 1/2 qualified sig/doc TS, 3/4 trusted TS, 5/6 unverified TS, 7 signingTime, 8 /M, 99 manual; >2 = unconfirmed (only a qualified timestamp confirms the date)
 }
 
 type certRow struct {
@@ -249,6 +249,12 @@ func (e *env) analyzeFile(p string) *fileReport {
 	if len(sigs) > maxSigs {
 		fr.Error = fmt.Sprintf("Plik zawiera więcej niż %d podpisów — analiza przerwana (możliwy plik złośliwy).", maxSigs)
 		return fr
+	}
+	for _, s := range sigs {
+		if s.ByteRange[2]-s.ByteRange[1]-2 > 2*maxContents {
+			fr.Error = fmt.Sprintf("Pole /Contents podpisu jest większe niż %d MB — analiza przerwana (możliwy plik złośliwy).", maxContents>>20)
+			return fr
+		}
 	}
 	pl := newPool()
 	pl.harvestStreams(data)
@@ -475,8 +481,8 @@ func (e *env) evalSig(n int, fname string, ps pdfSig, c *cmsSig, perr error, doc
 		s.finish()
 		return s
 	}
-	if d.rank > 4 {
-		s.add("Data podpisu", "warn", "Przyjęta data ("+d.Source+") nie jest potwierdzona zaufanym znacznikiem czasu. "+
+	if d.rank > 2 {
+		s.add("Data podpisu", "warn", "Przyjęta data ("+d.Source+") nie jest potwierdzona kwalifikowanym znacznikiem czasu. "+
 			"Wynik zakłada, że podpis złożono w tej dacie — należy to potwierdzić z innych źródeł.")
 	}
 	S := d.T
@@ -577,8 +583,8 @@ func (e *env) evalSig(n int, fname string, ps pdfSig, c *cmsSig, perr error, doc
 				s.add("Data utraty ważności klucza", "warn", "Wystawca wskazał invalidityDate "+fmtTime(dec.Invalidity)+
 					" — wcześniejszą niż data podpisu. Certyfikat traci ważność z chwilą unieważnienia (eIDAS art. 28 ust. 4), ale okoliczność ta może podważać wiarygodność podpisu.")
 			}
-			if !dec.RevokedAt.IsZero() && dec.Reason == 1 && d.rank > 4 {
-				s.add("Ryzyko antydatowania", "warn", "Certyfikat unieważniono z powodu kompromitacji klucza, a data podpisu nie jest potwierdzona znacznikiem czasu.")
+			if !dec.RevokedAt.IsZero() && dec.Reason == 1 && d.rank > 2 {
+				s.add("Ryzyko antydatowania", "warn", "Certyfikat unieważniono z powodu kompromitacji klucza, a data podpisu nie jest potwierdzona kwalifikowanym znacznikiem czasu.")
 			}
 		default:
 			s.add(name, "unknown", "Brak rozstrzygających danych o unieważnieniu na dzień podpisu (szczegóły w tabeli dowodów).")

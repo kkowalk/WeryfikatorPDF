@@ -208,16 +208,18 @@ func (e *tlEntry) allows(seal bool) bool {
 }
 
 // anchorState: ok only if some matching service was a CA (CA/QC or CA/PKC) with a positive
-// status at t; fail if the service had a negative status at t; otherwise unknown.
+// status at t; fail only if such a CA service had a negative status at t (a negative status of
+// another service type, e.g. TSA, says nothing about issuing certificates); otherwise unknown.
 func anchorState(anchor []*tlEntry, t time.Time) (state, detail string) {
 	state, detail = "unknown", "Wystawca nie figurował na liście zaufanych usług w dniu podpisu (brak wpisu usługi na tę datę)."
 	for _, a := range anchor {
 		st, ok := a.at(t)
+		ca := strings.HasSuffix(st.Type, "/CA/QC") || strings.HasSuffix(st.Type, "/CA/PKC")
 		switch {
 		case !ok:
-		case positive(st.Status) && (strings.HasSuffix(st.Type, "/CA/QC") || strings.HasSuffix(st.Type, "/CA/PKC")):
+		case ca && positive(st.Status):
 			return "ok", fmt.Sprintf("%s — %s (%s), status %s od %s", a.TSP, a.Service, a.Country, path.Base(st.Status), fmtTime(st.Start))
-		case !positive(st.Status):
+		case ca:
 			state, detail = "fail", fmt.Sprintf("Usługa wystawcy „%s” (%s, %s) miała na dzień podpisu status %s (od %s) — wystawca nie był wtedy zaufany.",
 				a.Service, a.TSP, a.Country, path.Base(st.Status), fmtTime(st.Start))
 		case state == "unknown":

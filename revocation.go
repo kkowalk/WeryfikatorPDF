@@ -138,19 +138,6 @@ func evalCRL(cert, issuer *x509.Certificate, der []byte, S time.Time) *revEviden
 	if rl.Number != nil {
 		ev.Number = rl.Number.String()
 	}
-	for _, e := range rl.RevokedCertificateEntries {
-		if e.SerialNumber.Cmp(cert.SerialNumber) != 0 {
-			continue
-		}
-		ev.RevokedAt, ev.Reason = e.RevocationTime, e.ReasonCode
-		for _, x := range e.Extensions {
-			if x.Id.String() == "2.5.29.24" { // invalidityDate
-				asn1.Unmarshal(x.Value, &ev.Invalidity)
-			}
-		}
-		ev.revoked(S)
-		return ev
-	}
 	var delta bool
 	var idpProblem string
 	var expiredOn time.Time
@@ -163,6 +150,23 @@ func evalCRL(cert, issuer *x509.Certificate, der []byte, S time.Time) *revEviden
 		case "2.5.29.60": // ExpiredCertsOnCRL
 			asn1.Unmarshal(x.Value, &expiredOn)
 		}
+	}
+	if idpProblem == idpIndirect { // entries may name other issuers' certificates (certificateIssuer) — a serial match proves nothing
+		ev.Note = idpIndirect + " — wpisy mogą dotyczyć certyfikatów innych wystawców, lista nie jest dowodem"
+		return ev
+	}
+	for _, e := range rl.RevokedCertificateEntries {
+		if e.SerialNumber.Cmp(cert.SerialNumber) != 0 {
+			continue
+		}
+		ev.RevokedAt, ev.Reason = e.RevocationTime, e.ReasonCode
+		for _, x := range e.Extensions {
+			if x.Id.String() == "2.5.29.24" { // invalidityDate
+				asn1.Unmarshal(x.Value, &ev.Invalidity)
+			}
+		}
+		ev.revoked(S)
+		return ev
 	}
 	switch {
 	case delta:
@@ -180,6 +184,8 @@ func evalCRL(cert, issuer *x509.Certificate, der []byte, S time.Time) *revEviden
 	return ev
 }
 
+const idpIndirect = "CRL pośrednia (IDP indirectCRL) — nieobsługiwana"
+
 // checkIDP returns why a CRL with this IssuingDistributionPoint (RFC 5280 §5.2.5) does not
 // prove cert's status, or "" if it covers cert.
 func checkIDP(der []byte, cert *x509.Certificate) string {
@@ -195,12 +201,12 @@ func checkIDP(der []byte, cert *x509.Certificate) string {
 		return "nieprawidłowe rozszerzenie IssuingDistributionPoint"
 	}
 	switch {
+	case idp.Indirect: // first: evalCRL ignores all entries of an indirect CRL
+		return idpIndirect
 	case idp.OnlyCA && !cert.IsCA, idp.OnlyUser && cert.IsCA, idp.OnlyAttr:
 		return "CRL obejmuje inny rodzaj certyfikatów (IDP onlyContains…)"
 	case idp.SomeReasons.BitLength > 0:
 		return "CRL obejmuje tylko wybrane powody unieważnienia (IDP onlySomeReasons)"
-	case idp.Indirect:
-		return "CRL pośrednia (IDP indirectCRL) — nieobsługiwana"
 	case len(idp.DP.FullBytes) == 0:
 		return ""
 	}
@@ -229,6 +235,13 @@ var oidArchiveCutoff = asn1.ObjectIdentifier{1, 3, 6, 1, 5, 5, 7, 48, 1, 6}
 func evalOCSP(cert, issuer *x509.Certificate, der []byte, S time.Time) *revEvidence {
 	r, err := ocsp.ParseResponseForCert(der, cert, issuer)
 	if err != nil {
+		return nil
+	}
+	// x/crypto/ocsp only checks that a delegated responder certificate is signed by issuer;
+	// RFC 6960 §4.2.2.2 also requires id-kp-OCSPSigning — otherwise any certificate of this CA
+	// (including the checked one) could vouch for itself.
+	if rc := r.Certificate; rc != nil && (!slices.Contains(rc.ExtKeyUsage, x509.ExtKeyUsageOCSPSigning) ||
+		bytes.Equal(rc.Raw, cert.Raw) || r.ProducedAt.Before(rc.NotBefore) || r.ProducedAt.After(rc.NotAfter)) {
 		return nil
 	}
 	ev := &revEvidence{Kind: "OCSP", ThisUpdate: r.ThisUpdate, NextUpdate: r.NextUpdate, ProducedAt: r.ProducedAt, SHA256: sha256hex(der),
