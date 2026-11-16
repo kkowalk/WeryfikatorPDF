@@ -76,7 +76,9 @@ jobs:
 
       - run: sha256sum "$EXE" > SHA256SUMS
 
-      - uses: actions/attest-build-provenance@v4
+      - name: Build provenance attestation (public repos; private ones need GitHub Enterprise Cloud)
+        if: github.event.repository.visibility == 'public'
+        uses: actions/attest-build-provenance@v4
         with:
           subject-path: ${{ env.EXE }}
 
