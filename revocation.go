@@ -96,8 +96,13 @@ const (
 
 type revEvidence struct {
 	Kind, Source, File string
+	Issuer, Number     string
+	SHA256             string
 	Status             revStatus
 	ThisUpdate         time.Time
+	NextUpdate         time.Time
+	ProducedAt         time.Time
+	ArchiveCutoff      time.Time
 	RevokedAt          time.Time
 	Invalidity         time.Time
 	Reason             int
@@ -126,7 +131,10 @@ func evalCRL(cert, issuer *x509.Certificate, der []byte, S time.Time) *revEviden
 		checkSigned(issuer, rl.SignatureAlgorithm, rl.RawTBSRevocationList, rl.Signature) != nil {
 		return nil
 	}
-	ev := &revEvidence{Kind: "CRL", ThisUpdate: rl.ThisUpdate}
+	ev := &revEvidence{Kind: "CRL", ThisUpdate: rl.ThisUpdate, NextUpdate: rl.NextUpdate, Issuer: rl.Issuer.String(), SHA256: sha256hex(der)}
+	if rl.Number != nil {
+		ev.Number = rl.Number.String()
+	}
 	for _, e := range rl.RevokedCertificateEntries {
 		if e.SerialNumber.Cmp(cert.SerialNumber) != 0 {
 			continue
@@ -182,21 +190,33 @@ func evalOCSP(cert, issuer *x509.Certificate, der []byte, S time.Time) *revEvide
 	if err != nil {
 		return nil
 	}
-	ev := &revEvidence{Kind: "OCSP", ThisUpdate: r.ThisUpdate}
+	ev := &revEvidence{Kind: "OCSP", ThisUpdate: r.ThisUpdate, NextUpdate: r.NextUpdate, ProducedAt: r.ProducedAt, SHA256: sha256hex(der),
+		Issuer: "responder = wystawca certyfikatu: " + issuer.Subject.String()}
+	if r.Certificate != nil {
+		ev.Issuer = "responder delegowany: " + r.Certificate.Subject.String()
+	}
 	switch r.Status {
 	case ocsp.Revoked:
 		ev.RevokedAt, ev.Reason = r.RevokedAt, r.RevocationReason
 		ev.revoked(S)
 	case ocsp.Good:
-		archive := false
 		for _, x := range r.Extensions {
-			archive = archive || x.Id.Equal(oidArchiveCutoff)
+			if x.Id.Equal(oidArchiveCutoff) {
+				asn1.Unmarshal(x.Value, &ev.ArchiveCutoff)
+			}
 		}
+		// RFC 6960 §4.4.4: status is retained for certificates that expired at or after ArchiveCutoff.
+		archived := !ev.ArchiveCutoff.IsZero() && !ev.ArchiveCutoff.After(cert.NotAfter)
+		expired := cert.NotAfter.Before(r.ThisUpdate)
 		switch {
 		case r.ThisUpdate.Before(S):
 			ev.Note = "odpowiedź OCSP sprzed daty podpisu — nie dowodzi stanu na tę datę"
-		case cert.NotAfter.Before(r.ThisUpdate) && !archive:
-			ev.Note = "odpowiedź dla certyfikatu już wygasłego, bez ArchiveCutoff — niewiarygodna (RFC 6960 §4.4.4)"
+		case expired && !archived:
+			ev.Note = "odpowiedź dla certyfikatu już wygasłego, bez ArchiveCutoff obejmującego jego ważność — niewiarygodna (RFC 6960 §4.4.4)"
+		case expired:
+			ev.Status = revGood
+			ev.Note = "status „good” potwierdzony po dacie podpisu; certyfikat wygasł przed wydaniem odpowiedzi, ale responder przechowuje statusy certyfikatów wygasłych od " +
+				fmtTime(ev.ArchiveCutoff) + " (ArchiveCutoff, RFC 6960 §4.4.4)"
 		default:
 			ev.Status = revGood
 			ev.Note = "status „good” potwierdzony po dacie podpisu"

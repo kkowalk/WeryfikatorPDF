@@ -37,8 +37,14 @@ type dateCand struct {
 	rank                 int // 1 qualified sig TS, 2 qualified doc TS, 3/4 non-qualified, 5 signingTime, 6 /M, 99 manual
 }
 
-type certRow struct{ Role, Subject, Issuer, Serial, Validity, ValidAtDate, File string }
-type revRow struct{ Cert, Kind, Source, File, ThisUpdate, Note, Result string }
+type certRow struct {
+	Role, Name, ValidAtDate, File string
+	Details                       []kv
+}
+type revRow struct {
+	Cert, Kind, Source, File, Note, Result string
+	Details                                []string
+}
 type tlRow struct{ Country, TSP, Service, Type, Status, File, URL string }
 
 type sigReport struct {
@@ -49,10 +55,14 @@ type sigReport struct {
 	Date, DateSource, DateLevel string
 	Qualified                   string
 	Checks                      []check
+	CMS                         []kv
+	Timeline                    []tlEvent
 	Chain                       []certRow
 	Rev                         []revRow
 	TL                          []tlRow
 	Verdict, VerdictClass       string
+	Notes                       []string  // certificate expiry/revocation, for the summary
+	at                          time.Time // date the signature is evaluated at
 }
 
 func (s *sigReport) add(name, state, detail string) {
@@ -61,6 +71,7 @@ func (s *sigReport) add(name, state, detail string) {
 
 type fileReport struct {
 	Path, Name, SHA256, Error, Report string
+	Embedded                          string
 	Size                              int64
 	Sigs                              []*sigReport
 	Verdict, VerdictClass             string
@@ -228,6 +239,7 @@ func (e *env) analyzeFile(p string) *fileReport {
 		}
 		items[i] = it
 	}
+	fr.Embedded = fmt.Sprintf("%d certyfikatów, %d CRL, %d odpowiedzi OCSP (z CMS i słownika DSS)", len(pl.certs), len(pl.crls), len(pl.ocsps))
 	for _, c := range pl.certs {
 		e.trust.load(country(c.Subject.Country))
 		e.trust.load(country(c.Issuer.Country))
@@ -338,6 +350,7 @@ func (e *env) evalSig(n int, fname string, ps pdfSig, c *cmsSig, perr error, doc
 	}
 	signer := c.signer
 	s.Signer, s.SignerDN = cn(signer), signer.Subject.String()
+	s.CMS = cmsDetails(ps, c)
 
 	if err := c.verify(ps.Signed); err != nil {
 		s.add("Integralność i podpis kryptograficzny", "fail", err.Error())
@@ -393,7 +406,14 @@ func (e *env) evalSig(n int, fname string, ps pdfSig, c *cmsSig, perr error, doc
 		return s
 	}
 	S := d.T
+	s.at = S
 	s.Date, s.DateSource, s.DateLevel = d.Shown, d.Source, d.Level
+	s.event(S, "PRZYJĘTA DATA PODPISU — "+d.Source, d.Level, evSign)
+	for _, cd := range cands {
+		if cd.rank != d.rank {
+			s.event(cd.T, "Data podpisu wg: "+cd.Source, cd.Level, "")
+		}
+	}
 	if !sigTS.IsZero() && S.After(sigTS) {
 		s.add("Spójność daty", "warn", "Przyjęta data jest późniejsza niż znacznik czasu podpisu ("+fmtTime(sigTS)+"), a podpis istniał już w chwili znacznika.")
 	}
@@ -408,10 +428,16 @@ func (e *env) evalSig(n int, fname string, ps pdfSig, c *cmsSig, perr error, doc
 			role = "wystawca z listy zaufanych usług"
 		}
 		valid := !S.Before(ct.NotBefore) && !S.After(ct.NotAfter)
-		s.Chain = append(s.Chain, certRow{role, ct.Subject.String(), ct.Issuer.String(), ct.SerialNumber.Text(16),
-			fmtTime(ct.NotBefore) + " — " + fmtTime(ct.NotAfter), map[bool]string{true: "tak", false: "NIE"}[valid], e.ev.save("cert", "cer", ct.Raw)})
+		s.Chain = append(s.Chain, certRow{role, cn(ct), map[bool]string{true: "tak", false: "NIE"}[valid], e.ev.save("cert", "cer", ct.Raw), certDetails(ct)})
+		src := "certyfikat " + cn(ct) + ", nr " + ct.SerialNumber.Text(16)
+		s.event(ct.NotBefore, "Początek ważności certyfikatu: "+cn(ct), src, evStart)
+		s.event(ct.NotAfter, "Koniec ważności certyfikatu: "+cn(ct), src, evStop)
+		if ct.NotAfter.Before(time.Now()) {
+			s.Notes = append(s.Notes, fmt.Sprintf("Certyfikat %s wygasł %s (%s)", cn(ct), fmtTime(ct.NotAfter), relTo(ct.NotAfter, S)))
+		}
 		if valid {
-			s.add("Okres ważności: "+cn(ct), "ok", "Data podpisu mieści się w okresie ważności certyfikatu.")
+			s.add("Okres ważności: "+cn(ct), "ok", fmt.Sprintf("Ważny od %s do %s. Data podpisu przypada %s po początku i %s przed końcem ważności.",
+				fmtTime(ct.NotBefore), fmtTime(ct.NotAfter), fmtDelta(S.Sub(ct.NotBefore)), fmtDelta(ct.NotAfter.Sub(S))))
 		} else {
 			s.add("Okres ważności: "+cn(ct), "fail", "Certyfikat ważny "+fmtTime(ct.NotBefore)+" — "+fmtTime(ct.NotAfter)+"; nie obejmuje daty podpisu.")
 		}
@@ -429,6 +455,7 @@ func (e *env) evalSig(n int, fname string, ps pdfSig, c *cmsSig, perr error, doc
 		if st, ok := a.at(S); ok {
 			row.Type = strings.TrimPrefix(st.Type, "http://uri.etsi.org/TrstSvc/Svctype/")
 			row.Status = path.Base(st.Status) + " (od " + fmtTime(st.Start) + ")"
+			s.event(st.Start, "Usługa „"+a.Service+"” ("+row.Type+") ze statusem "+path.Base(st.Status)+" na liście zaufanych usług", a.URL, "")
 		}
 		s.TL = append(s.TL, row)
 	}
@@ -436,14 +463,30 @@ func (e *env) evalSig(n int, fname string, ps pdfSig, c *cmsSig, perr error, doc
 	for i := 0; i < len(chain)-1; i++ {
 		evs, st, dec := checkRevocation(chain[i], chain[i+1], S, pl, e.net, e.ev)
 		for _, r := range evs {
-			s.Rev = append(s.Rev, revRow{cn(chain[i]), r.Kind, r.Source, r.File, fmtTime(r.ThisUpdate), r.Note, r.Status.String()})
+			s.Rev = append(s.Rev, revRow{cn(chain[i]), r.Kind, r.Source, r.File, r.Note, r.Status.String(), revDetails(r, chain[i])})
 		}
 		name := "Status unieważnienia: " + cn(chain[i])
+		if dec != nil {
+			label := dec.Kind
+			if dec.Number != "" {
+				label += " nr " + dec.Number
+			}
+			s.event(dec.ThisUpdate, "Wydanie dowodu statusu ("+label+") dla: "+cn(chain[i]), dec.Source, evEvidence)
+			s.event(dec.RevokedAt, "Unieważnienie certyfikatu: "+cn(chain[i])+" — powód: "+reasons[dec.Reason], label+", "+dec.Source, evRevoke)
+			s.event(dec.Invalidity, "Wskazana data utraty ważności klucza (invalidityDate): "+cn(chain[i]), label+", "+dec.Source, evRevoke)
+			if !dec.RevokedAt.IsZero() {
+				s.Notes = append(s.Notes, fmt.Sprintf("Certyfikat %s unieważniony %s (%s), powód: %s", cn(chain[i]), fmtTime(dec.RevokedAt), relTo(dec.RevokedAt, S), reasons[dec.Reason]))
+			}
+		}
 		switch st {
 		case revRevoked:
 			s.add(name, "fail", dec.Note+" ("+dec.Kind+", "+dec.Source+")")
 		case revGood:
-			s.add(name, "ok", dec.Note+" ("+dec.Kind+" z "+fmtTime(dec.ThisUpdate)+", "+dec.Source+")")
+			detail := dec.Note + " (" + dec.Kind + " z " + fmtTime(dec.ThisUpdate) + ", " + dec.Source + "; nr seryjny " + chain[i].SerialNumber.Text(16) + ")"
+			if !dec.RevokedAt.IsZero() {
+				detail += fmt.Sprintf(". Unieważnienie nastąpiło %s po podpisie; certyfikat traci ważność dopiero z chwilą unieważnienia (art. 28 ust. 4 eIDAS), więc w chwili podpisu był ważny.", fmtDelta(dec.RevokedAt.Sub(S)))
+			}
+			s.add(name, "ok", detail)
 			if !dec.Invalidity.IsZero() && !dec.Invalidity.After(S) {
 				s.add("Data utraty ważności klucza", "warn", "Wystawca wskazał invalidityDate "+fmtTime(dec.Invalidity)+
 					" — wcześniejszą niż data podpisu. Certyfikat traci ważność z chwilą unieważnienia (eIDAS art. 28 ust. 4), ale okoliczność ta może podważać wiarygodność podpisu.")
@@ -461,6 +504,10 @@ func (e *env) evalSig(n int, fname string, ps pdfSig, c *cmsSig, perr error, doc
 }
 
 func (s *sigReport) finish(d dateCand) {
+	if len(s.Timeline) > 0 {
+		s.event(time.Now(), "Sporządzenie raportu", tool(), evEvidence)
+		s.sortTimeline()
+	}
 	_, cls := verdict(s.Checks)
 	s.VerdictClass = cls
 	switch cls {

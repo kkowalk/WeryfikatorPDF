@@ -54,8 +54,8 @@ type fetched struct {
 }
 
 type netFetcher struct {
-	client *http.Client
-	ev     *evidence
+	client  *http.Client
+	ev      *evidence
 	cache   map[string]fetched
 	Log     []fetchLog
 	offline bool

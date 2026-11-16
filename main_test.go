@@ -75,6 +75,17 @@ func TestEvalCRLAtSigningDate(t *testing.T) {
 	}
 }
 
+func TestFmtDelta(t *testing.T) {
+	for d, want := range map[time.Duration]string{
+		0: "< 1 s", 90 * time.Second: "1 min 30 s",
+		186*24*time.Hour + 21*time.Hour + 5*time.Minute + 9*time.Second: "186 d 21 h 5 min",
+	} {
+		if got := fmtDelta(d); got != want {
+			t.Errorf("fmtDelta(%v) = %q, want %q", d, got, want)
+		}
+	}
+}
+
 func TestPAdESEndToEnd(t *testing.T) {
 	_, leaf, _, key := pki(t, S.AddDate(1, 0, 0))
 	pdf := buildPDF(t, leaf, key)
