@@ -81,13 +81,52 @@ Wymaga Go ≥ 1.27.
 
 ```
 go test ./...
-CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o weryfikator-podpisow.exe .
+CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -ldflags "-s -w -X main.version=0.1.0" -o weryfikator-podpisow.exe .
 ```
 
-Niepodpisany `.exe` może zostać zatrzymany przez SmartScreen lub AppLocker. Do dystrybucji warto podpisać
-plik certyfikatem do podpisywania kodu.
+Wydanie: wypchnięcie tagu `v*` (np. `git tag -a v0.1.1 -m v0.1.1 && git push origin v0.1.1`) uruchamia
+[workflow release](.github/workflows/release.yml). Workflow wykonuje testy, buduje `.exe` z metadanymi wersji,
+podpisuje go (jeśli podpis jest skonfigurowany), wylicza `SHA256SUMS` i tworzy GitHub Release.
+
+Niepodpisany `.exe` może zostać zatrzymany przez SmartScreen lub AppLocker.
+
+## Podpisywanie wydań — procedura (SignPath Foundation)
+
+Status: **wydania nie są jeszcze podpisywane**. Workflow publikuje je bez podpisu, dopóki nie ustawi się
+zmiennej `SIGNPATH_ORGANIZATION_ID`.
+
+Warunki: SignPath Foundation podpisuje wyłącznie projekty open source z publicznym repozytorium, które
+mają już opublikowane wydanie ([warunki](https://signpath.org/terms)).
+
+1. Upublicznij repozytorium: Settings → General → Danger Zone → Change visibility → Public.
+   Upublicznienie włącza też atestację builda (`attest-build-provenance`), w prywatnych repo dostępną tylko
+   w GitHub Enterprise Cloud.
+2. Włącz uwierzytelnianie dwuskładnikowe (2FA) na koncie GitHub.
+3. Złóż wniosek na [signpath.org](https://signpath.org/) (formularz dla projektów OSS). Podaj:
+   - adres repozytorium i istniejącego wydania,
+   - link do sekcji [Code signing policy](#code-signing-policy),
+   - link do [PRIVACY.md](PRIVACY.md),
+   - opis działania programu.
+4. Po akceptacji wniosku skonfiguruj SignPath (z włączonym MFA):
+   - Trusted Build Systems → dodaj predefiniowany **GitHub.com** i powiąż go z projektem,
+   - konfiguracja artefaktu → wklej treść [.signpath/artifact-configuration.xml](.signpath/artifact-configuration.xml),
+   - polityka podpisu z ręcznym zatwierdzaniem (zatwierdzający zgodnie z tabelą ról poniżej),
+   - token API dla użytkownika z rolą *submitter* w tej polityce,
+   - opcjonalnie aplikacja SignPath dla GitHub, potrzebna do oceny audit logu
+     ([dokumentacja](https://docs.signpath.io/trusted-build-systems/github)).
+5. Skonfiguruj GitHub w zakładce Settings → Secrets and variables → Actions:
+   - secret `SIGNPATH_API_TOKEN` (token z kroku 4),
+   - zmienne `SIGNPATH_ORGANIZATION_ID`, `SIGNPATH_PROJECT_SLUG` i `SIGNPATH_SIGNING_POLICY_SLUG`
+     (wartości z panelu SignPath).
+6. Wypchnij nowy tag wersji. Workflow wyśle `.exe` do SignPath i poczeka do 2 godzin. Zatwierdź żądanie
+   w panelu SignPath, a podpisany plik trafi do Release. Wcześniejszych wydań nie da się podpisać wstecz.
+
+Alternatywa przy repozytorium prywatnym: komercyjny certyfikat OV do podpisywania kodu, np. Certum Standard
+Code Signing. Wymaga przerobienia kroku podpisu w workflow na API dostawcy.
 
 ## Code signing policy
+
+> Planowane: wniosek do SignPath Foundation jeszcze nie został złożony (procedura powyżej). Do tego czasu wydania są niepodpisane.
 
 Free code signing provided by [SignPath.io](https://about.signpath.io), certificate by [SignPath Foundation](https://signpath.org)
 
