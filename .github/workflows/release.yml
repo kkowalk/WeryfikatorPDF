@@ -1,0 +1,88 @@
+# Release: test, build, sign via SignPath Foundation (once configured), attest, publish.
+# Trigger: push a tag v*, e.g. `git tag v0.1.0 && git push origin v0.1.0`.
+# Until repository variable SIGNPATH_ORGANIZATION_ID is set, the release is published unsigned
+# (SignPath Foundation requires the project to be already released before applying).
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    runs-on: ubuntu-latest # SignPath OSS requires GitHub-hosted runners
+    permissions:
+      contents: write     # create the GitHub Release
+      actions: read       # SignPath fetches the uploaded artifact
+      id-token: write     # build provenance attestation
+      attestations: write
+    env:
+      EXE: weryfikator-podpisow.exe
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - run: go test ./...
+
+      - name: PE version resource (metadata checked by SignPath)
+        run: |
+          VER="${GITHUB_REF_NAME#v}"
+          echo "VER=$VER" >> "$GITHUB_ENV"
+          go run github.com/tc-hib/go-winres@v0.3.3 simply --arch amd64 \
+            --product-name WeryfikatorPDF --product-version "$VER" --file-version "$VER" \
+            --file-description "Weryfikacja podpisow PAdES na dzien podpisania" \
+            --copyright "Copyright (c) 2026 kkowalk, MIT License" \
+            --original-filename "$EXE"
+
+      - name: Build
+        env:
+          CGO_ENABLED: '0'
+          GOOS: windows
+          GOARCH: amd64
+        run: go build -trimpath -ldflags "-s -w -X main.version=$VER" -o "$EXE" .
+
+      - name: Upload unsigned artifact
+        id: unsigned
+        uses: actions/upload-artifact@v7
+        with:
+          name: unsigned
+          path: ${{ env.EXE }}
+          if-no-files-found: error
+
+      - name: Sign (SignPath Foundation, manual approval)
+        if: vars.SIGNPATH_ORGANIZATION_ID != ''
+        uses: signpath/github-action-submit-signing-request@v3
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+          signing-policy-slug: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG }}
+          github-artifact-id: ${{ steps.unsigned.outputs.artifact-id }}
+          wait-for-completion: true
+          wait-for-completion-timeout-in-seconds: 7200
+          output-artifact-directory: signed
+
+      - name: Use signed binary
+        if: vars.SIGNPATH_ORGANIZATION_ID != ''
+        run: mv -f "signed/$EXE" "$EXE"
+
+      - run: sha256sum "$EXE" > SHA256SUMS
+
+      - uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: ${{ env.EXE }}
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" "$EXE" SHA256SUMS --title "$GITHUB_REF_NAME" --generate-notes \
+            --notes "Code signing policy: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY#code-signing-policy"
