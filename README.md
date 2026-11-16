@@ -17,7 +17,19 @@ Opcja `-offline` wyłącza wszystkie połączenia. Szczegóły: [polityka prywat
 
 ## Użycie
 
-Przeciągnij pliki PDF lub katalog na `weryfikator-podpisow.exe`, albo:
+### Okno programu (Windows)
+
+Dwuklik na `weryfikator-podpisow.exe` albo przeciągnięcie plików lub folderów na jego ikonę otwiera okno programu
+(natywne Win32, bez instalacji i bez nasłuchu sieciowego). W oknie można:
+- dodawać pliki przeciągnięciem lub przyciskami „Dodaj pliki…” / „Dodaj folder…”,
+- zaznaczyć opcje „Pytaj o datę każdego podpisu” i „Tryb offline”, wybrać katalog raportu,
+- śledzić stan i wynik każdego pliku. Podwójne kliknięcie wiersza otwiera raport pliku.
+
+Przy uruchomieniu z Eksploratora na chwilę mignie okno konsoli, zanim program je ukryje.
+
+### Konsola
+
+Uruchomienie z wiersza poleceń (cmd, PowerShell) z argumentami działa w trybie konsolowym:
 
 ```
 weryfikator-podpisow.exe [-pytaj] [-y] [-offline] [-o katalog_raportu] plik.pdf katalog\ ...
@@ -25,6 +37,7 @@ weryfikator-podpisow.exe [-pytaj] [-y] [-offline] [-o katalog_raportu] plik.pdf 
 
 | Opcja | Znaczenie |
 |---|---|
+| `-gui` | otwórz okno programu także przy uruchomieniu z konsoli |
 | `-pytaj` | pytaj o datę każdego podpisu (domyślnie przyjmowana jest data wykryta w podpisie) |
 | `-y` | nie czekaj na Enter na końcu (do skryptów) |
 | `-o` | katalog raportu (domyślnie `weryfikacja-podpisow-<data>` obok pierwszego pliku) |

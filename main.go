@@ -79,10 +79,53 @@ type fileReport struct {
 
 type env struct {
 	in    *bufio.Reader
-	auto  bool
+	ask   func(fname string, n int, signer string, cands []dateCand) dateCand // nil: strongest detected date
+	logf  func(format string, a ...any)                                       // progress output (console)
 	ev    *evidence
 	net   *netFetcher
 	trust *trust
+}
+
+func newEnv(out string, offline bool) *env {
+	e := &env{logf: func(string, ...any) {}}
+	e.ev = &evidence{dir: out, saved: map[[32]byte]string{}}
+	e.net = &netFetcher{client: &http.Client{Timeout: 60 * time.Second}, ev: e.ev, cache: map[string]fetched{}, offline: offline}
+	e.trust = &trust{net: e.net, loaded: map[string]bool{}}
+	return e
+}
+
+const privacyNote = "Dokumenty nie są wysyłane. Program pobiera listy zaufanych usług UE oraz CRL/OCSP z adresów zapisanych w certyfikatach (zapytanie OCSP zawiera numer seryjny certyfikatu)."
+
+// defaultOut: new folder next to the first file (or inside the first folder argument).
+func defaultOut(files []string, firstArg string) string {
+	base := filepath.Dir(files[0])
+	if st, err := os.Stat(firstArg); err == nil && st.IsDir() {
+		base = firstArg
+	}
+	return filepath.Join(base, "weryfikacja-podpisow-"+time.Now().Format("20060102-150405"))
+}
+
+// verifyAll analyses files and writes all reports into out. progress(i, nil) is called
+// before file i, progress(i, fr) after it.
+func (e *env) verifyAll(files []string, out string, progress func(i int, fr *fileReport)) ([]*fileReport, error) {
+	if err := os.MkdirAll(out, 0o755); err != nil {
+		return nil, fmt.Errorf("nie można utworzyć katalogu raportu: %w", err)
+	}
+	var reports []*fileReport
+	for i, f := range files {
+		progress(i, nil)
+		fr := e.analyzeFile(f)
+		fr.Report = fmt.Sprintf("%03d-%s.html", i+1, safeName(strings.TrimSuffix(fr.Name, filepath.Ext(fr.Name))))
+		if err := writeFileReport(out, fr); err != nil {
+			return reports, fmt.Errorf("błąd zapisu raportu: %w", err)
+		}
+		reports = append(reports, fr)
+		progress(i, fr)
+	}
+	if err := writeIndex(out, reports, e); err != nil {
+		return reports, fmt.Errorf("błąd zapisu raportu zbiorczego: %w", err)
+	}
+	return reports, nil
 }
 
 func main() { os.Exit(run()) }
@@ -92,21 +135,25 @@ func run() int {
 	noWait := flag.Bool("y", false, "nie czekaj na Enter na końcu (do skryptów)")
 	outDir := flag.String("o", "", "katalog na raport (domyślnie: nowy katalog obok pierwszego pliku)")
 	offline := flag.Bool("offline", false, "bez połączeń sieciowych (tylko dane osadzone w PDF; bez list zaufanych usług wynik będzie nierozstrzygający)")
+	gui := flag.Bool("gui", false, "otwórz okno programu (domyślnie przy uruchomieniu z Eksploratora)")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "weryfikator-podpisow %s — ważność podpisów PAdES na dzień podpisania\n\n"+
-			"Użycie: weryfikator-podpisow.exe [-pytaj] [-y] [-offline] [-o katalog] plik.pdf|katalog ...\n"+
-			"(można też przeciągnąć pliki lub katalog na ikonę programu)\n\n", version)
+			"Użycie: weryfikator-podpisow.exe [-pytaj] [-y] [-offline] [-o katalog] [-gui] plik.pdf|katalog ...\n"+
+			"Dwuklik lub przeciągnięcie plików na ikonę otwiera okno programu.\n\n", version)
 		flag.PrintDefaults()
 	}
 	flag.Parse()
-	e := &env{in: bufio.NewReader(os.Stdin), auto: !*ask}
+	if *gui || launchedFromExplorer() {
+		return runGUI(collect(flag.Args()))
+	}
+
+	in := bufio.NewReader(os.Stdin)
 	if !*noWait {
 		defer func() {
 			fmt.Print("\nNaciśnij Enter, aby zakończyć...")
-			e.in.ReadString('\n')
+			in.ReadString('\n')
 		}()
 	}
-
 	files := collect(flag.Args())
 	if len(files) == 0 {
 		flag.Usage()
@@ -114,41 +161,28 @@ func run() int {
 	}
 	out := *outDir
 	if out == "" {
-		base := filepath.Dir(files[0])
-		if st, err := os.Stat(flag.Arg(0)); err == nil && st.IsDir() {
-			base = flag.Arg(0)
-		}
-		out = filepath.Join(base, "weryfikacja-podpisow-"+time.Now().Format("20060102-150405"))
+		out = defaultOut(files, flag.Arg(0))
 	}
-	if err := os.MkdirAll(out, 0o755); err != nil {
-		fmt.Fprintln(os.Stderr, "Nie można utworzyć katalogu raportu:", err)
-		return 1
+	e := newEnv(out, *offline)
+	e.in = in
+	e.logf = func(format string, a ...any) { fmt.Printf(format, a...) }
+	if *ask {
+		e.ask = e.consoleAsk
 	}
-	e.ev = &evidence{dir: out, saved: map[[32]byte]string{}}
-	e.net = &netFetcher{client: &http.Client{Timeout: 60 * time.Second}, ev: e.ev, cache: map[string]fetched{}, offline: *offline}
 	if *offline {
 		fmt.Println("Tryb offline: brak połączeń sieciowych.")
 	} else {
-		fmt.Println("Prywatność: dokumenty nie są wysyłane. Program pobiera listy zaufanych usług UE oraz CRL/OCSP\n" +
-			"z adresów zapisanych w certyfikatach (zapytanie OCSP zawiera numer seryjny certyfikatu).\n" +
-			"Szczegóły: PRIVACY.md. Opcja -offline wyłącza połączenia.")
+		fmt.Println("Prywatność: " + privacyNote + "\nSzczegóły: PRIVACY.md. Opcja -offline wyłącza połączenia.")
 	}
-	e.trust = &trust{net: e.net, loaded: map[string]bool{}}
-
-	var reports []*fileReport
-	for i, f := range files {
-		fmt.Printf("\n[%d/%d] %s\n", i+1, len(files), f)
-		fr := e.analyzeFile(f)
-		fr.Report = fmt.Sprintf("%03d-%s.html", i+1, safeName(strings.TrimSuffix(fr.Name, filepath.Ext(fr.Name))))
-		if err := writeFileReport(out, fr); err != nil {
-			fmt.Fprintln(os.Stderr, "Błąd zapisu raportu:", err)
-			return 1
+	_, err := e.verifyAll(files, out, func(i int, fr *fileReport) {
+		if fr == nil {
+			fmt.Printf("\n[%d/%d] %s\n", i+1, len(files), files[i])
+		} else {
+			fmt.Println("  →", fr.Verdict)
 		}
-		fmt.Println("  →", fr.Verdict)
-		reports = append(reports, fr)
-	}
-	if err := writeIndex(out, reports, e); err != nil {
-		fmt.Fprintln(os.Stderr, "Błąd zapisu raportu zbiorczego:", err)
+	})
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
 	index := filepath.Join(out, "index.html")
@@ -400,7 +434,7 @@ func (e *env) evalSig(n int, fname string, ps pdfSig, c *cmsSig, perr error, doc
 	}
 	s.Dates = cands
 
-	d := e.askDate(fname, n, s.Signer, cands)
+	d := e.pickDate(fname, n, s.Signer, cands)
 	if d.T.IsZero() {
 		s.add("Data podpisania", "unknown", "Brak daty w podpisie i nie podano jej ręcznie.")
 		s.finish(d)
@@ -588,17 +622,27 @@ func qualification(signer *x509.Certificate, anchor []*tlEntry, S time.Time) str
 	return "CZĘŚCIOWO — " + adv + " oparty na certyfikacie kwalifikowanym, bez deklaracji QSCD" + note
 }
 
-func (e *env) askDate(fname string, n int, signer string, cands []dateCand) dateCand {
-	fmt.Printf("\n  %s — podpis #%d: %s\n", fname, n, signer)
+// manualDate is a date entered by the user (console or GUI).
+func manualDate(t time.Time) dateCand {
+	return dateCand{T: t, Shown: fmtTime(t), Source: "podana ręcznie przez użytkownika",
+		Level: "oświadczenie użytkownika — bez dowodu kryptograficznego", rank: 99}
+}
+
+func (e *env) pickDate(fname string, n int, signer string, cands []dateCand) dateCand {
+	e.logf("\n  %s — podpis #%d: %s\n", fname, n, signer)
 	for _, c := range cands {
-		fmt.Printf("    %s  %s\n      [%s]\n", c.Shown, c.Source, c.Level)
+		e.logf("    %s  %s\n      [%s]\n", c.Shown, c.Source, c.Level)
 	}
-	if e.auto {
-		if len(cands) > 0 {
-			return cands[0]
-		}
-		return dateCand{}
+	if e.ask != nil {
+		return e.ask(fname, n, signer, cands)
 	}
+	if len(cands) > 0 {
+		return cands[0]
+	}
+	return dateCand{}
+}
+
+func (e *env) consoleAsk(fname string, n int, signer string, cands []dateCand) dateCand {
 	for {
 		if len(cands) > 0 {
 			fmt.Printf("  Data do oceny: %s\n  Enter = akceptuj, albo wpisz inną (RRRR-MM-DD GG:MM[:SS], czas lokalny): ", cands[0].Shown)
@@ -615,8 +659,7 @@ func (e *env) askDate(fname string, n int, signer string, cands []dateCand) date
 		}
 		for _, l := range []string{"2006-01-02 15:04:05", "2006-01-02 15:04", "2006-01-02T15:04:05", "2006-01-02T15:04"} {
 			if t, perr := time.ParseInLocation(l, line, time.Local); perr == nil {
-				return dateCand{T: t, Shown: fmtTime(t), Source: "podana ręcznie przez użytkownika",
-					Level: "oświadczenie użytkownika — bez dowodu kryptograficznego", rank: 99}
+				return manualDate(t)
 			}
 		}
 		fmt.Println("  Nieprawidłowy format daty.")
