@@ -30,9 +30,9 @@ tr.unknown td:nth-child(2),tr.warn td:nth-child(2){color:#a16207;font-weight:700
 .lg span{display:inline-block;padding:1px 8px;margin-right:6px;border-left:6px solid}
 .lg .sign{background:#dbeafe;border-color:#1d4ed8}.lg .start{background:#ecfdf3;border-color:#16a34a}
 .lg .stop{background:#fff7ed;border-color:#ea580c}.lg .revoke{background:#fef2f2;border-color:#dc2626}
-.note{color:#9a3412}
+.note{color:#9a3412}.copy{float:right;font:inherit;cursor:pointer}
 ul.ev{margin:0;padding-left:16px}
-.print{float:right;font:inherit;padding:6px 14px;cursor:pointer}@media print{.print{display:none}*{print-color-adjust:exact;-webkit-print-color-adjust:exact}a{color:inherit}h2{break-before:page}}`
+.print{float:right;font:inherit;padding:6px 14px;cursor:pointer}@media print{.print,.copy{display:none}*{print-color-adjust:exact;-webkit-print-color-adjust:exact}a{color:inherit}h2{break-before:page}}`
 
 const methodology = `<h2>Metodyka i ograniczenia</h2>
 <ul class="small">
@@ -52,6 +52,22 @@ Wszystkie wykorzystane dane zapisano w katalogu <span class="mono">dowody/</span
 z kwalifikatorów usług (ServiceInformationExtensions) uwzględniany jest tylko zakres ForeSignatures/ForeSeals z bieżącego wpisu; nie jest sprawdzany status unieważnienia certyfikatów TSA i delegowanych responderów OCSP;
 nie jest analizowane uprawnienie do zmian po podpisaniu (DocMDP) — wykrywane są jedynie zmiany poza zakresem podpisu; obsługiwane jest kodowanie DER podpisu CMS.</li>
 </ul>`
+
+// copyJS puts the timeline table into the clipboard with inline styles and fixed column widths,
+// because Word drops class-based CSS on paste; text/plain carries TSV for Excel.
+const copyJS = `<script>
+function copyTl(b){
+var t=b.parentNode.nextElementSibling,W=[16,16,46,22],h="",p=[];
+function hex(c){var n=c.match(/[\d.]+/g);return !n||n[3]==0?"":"#"+n.slice(0,3).map(function(v){return(+v).toString(16).padStart(2,"0")}).join("")}
+function esc(s){return s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/\n/g,"<br>")}
+for(var r of t.rows){var q=[];h+="<tr>";
+for(var i=0;i<r.cells.length;i++){var d=r.cells[i],s=getComputedStyle(d),bg=hex(s.backgroundColor),bl=hex(s.borderLeftColor),g=d.tagName.toLowerCase();
+h+="<"+g+" width=\""+W[i]+"%\""+(bg?" bgcolor=\""+bg+"\"":"")+" style=\"border:1px solid #bfbfbf;"+(i==0&&bl&&parseFloat(s.borderLeftWidth)>2?"border-left:4.5pt solid "+bl+";":"")+(bg?"background:"+bg+";":"")+"color:"+hex(s.color)+";font-weight:"+s.fontWeight+";font-family:Calibri,sans-serif;font-size:9pt;padding:2pt 4pt;text-align:left;vertical-align:top\">"+esc(d.innerText)+"</"+g+">";
+q.push(d.innerText.replace(/\s+/g," "))}
+h+="</tr>";p.push(q.join("\t"))}
+h="<table width=\"100%\" style=\"border-collapse:collapse;width:100%\">"+h+"</table>";
+navigator.clipboard.write([new ClipboardItem({"text/html":new Blob([h],{type:"text/html"}),"text/plain":new Blob([p.join("\r\n")],{type:"text/plain"})})]).then(function(){b.textContent="Skopiowano"},function(){b.textContent="Kopiowanie niedostępne"})}
+</script>`
 
 var fileTpl = template.Must(template.New("f").Parse(`<!doctype html><html lang="pl"><head><meta charset="utf-8">
 <title>Weryfikacja — {{.F.Name}}</title><style>` + css + `</style></head><body>
@@ -87,7 +103,7 @@ var fileTpl = template.Must(template.New("f").Parse(`<!doctype html><html lang="
 <table><tr><th>Kontrola</th><th>Wynik</th><th>Szczegóły</th></tr>
 {{range .Checks}}<tr class="{{.State}}"><td>{{.Name}}</td><td>{{.Label}}</td><td>{{.Detail}}</td></tr>{{end}}</table>
 {{if .Timeline}}<h3>Oś czasu</h3>
-<p class="small lg"><span class="start">początek ważności</span><span class="sign">podpis</span><span class="stop">koniec ważności</span><span class="revoke">unieważnienie</span></p>
+<p class="small lg"><span class="start">początek ważności</span><span class="sign">podpis</span><span class="stop">koniec ważności</span><span class="revoke">unieważnienie</span><button class="copy" type="button" onclick="copyTl(this)">Kopiuj oś czasu (Word)</button></p>
 <table class="tl"><tr><th>Data</th><th>Względem podpisu</th><th>Zdarzenie</th><th>Źródło</th></tr>
 {{range .Timeline}}<tr class="{{.Kind}}"><td>{{.When}}</td><td>{{.Rel}}</td><td>{{.What}}</td><td class="small">{{.Src}}</td></tr>{{end}}</table>{{end}}
 {{if .CMS}}<h3>Szczegóły podpisu (CMS)</h3>
@@ -103,7 +119,7 @@ var fileTpl = template.Must(template.New("f").Parse(`<!doctype html><html lang="
 {{range .Rev}}<tr><td>{{.Cert}}</td><td>{{.Kind}}</td><td class="mono small">{{.Source}}{{if .File}} — <a href="{{.File}}">kopia</a>{{end}}</td>
 <td class="small"><ul class="ev">{{range .Details}}<li>{{.}}</li>{{end}}</ul></td><td>{{.Result}}</td><td>{{.Note}}</td></tr>{{end}}</table>{{end}}
 {{end}}
-` + methodology + `</body></html>`))
+` + methodology + copyJS + `</body></html>`))
 
 var indexTpl = template.Must(template.New("i").Parse(`<!doctype html><html lang="pl"><head><meta charset="utf-8">
 <title>Weryfikacja podpisów — raport zbiorczy</title><style>` + css + `</style></head><body>

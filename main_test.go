@@ -11,6 +11,8 @@ import (
 	"encoding/hex"
 	"fmt"
 	"math/big"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -338,5 +340,26 @@ func TestIndirectCRLIsNoEvidence(t *testing.T) {
 	idp := pkix.Extension{Id: asn1.ObjectIdentifier{2, 5, 29, 28}, Critical: true, Value: []byte{0x30, 0x03, 0x84, 0x01, 0xff}}
 	if ev := crl([]pkix.Extension{idp}); ev == nil || ev.Status != revUnknown {
 		t.Errorf("indirect CRL entry treated as evidence: %+v", ev)
+	}
+}
+
+func TestContentsLimit(t *testing.T) {
+	e := newEnv(t.TempDir(), true)
+	for _, c := range []struct {
+		hexLen   int
+		rejected bool
+	}{{2 * maxContents, false}, {2*maxContents + 2, true}} {
+		head := "%%PDF-1.7\n1 0 obj\n<< /Type /Sig /ByteRange [0 %010d %010d %010d] /Contents "
+		tail := " >>\nendobj\n%%EOF\n"
+		b := len(fmt.Sprintf(head, 0, 0, 0))
+		pdf := fmt.Sprintf(head, b, b+c.hexLen+2, len(tail)) + "<" + strings.Repeat("0", c.hexLen) + ">" + tail
+		p := filepath.Join(t.TempDir(), "a.pdf")
+		if err := os.WriteFile(p, []byte(pdf), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		fr := e.analyzeFile(p)
+		if got := strings.Contains(fr.Error, "/Contents"); got != c.rejected {
+			t.Errorf("/Contents of %d hex digits: rejected=%v, want %v (%q)", c.hexLen, got, c.rejected, fr.Error)
+		}
 	}
 }

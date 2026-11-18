@@ -54,6 +54,7 @@ Wynik:
 - `index.html` — zestawienie zbiorcze i log zapytań sieciowych,
 - `NNN-<plik>.html` — raport dla każdego pliku. Przycisk „Drukuj raport” otwiera okno drukowania przeglądarki;
   stamtąd można wydrukować raport albo zapisać go jako PDF, np. jako załącznik do akt.
+  Przycisk „Kopiuj oś czasu (Word)” kopiuje tabelę osi czasu z kolorami i stałymi szerokościami kolumn do wklejenia w Wordzie (lub jako TSV do Excela).
 - `podsumowanie.csv` — UTF-8, separator `;`,
 - `dowody/` — kopie użytych certyfikatów, CRL, OCSP i list zaufanych usług, a przy zmianach po podpisaniu
   także wersja PDF, którą faktycznie podpisano.
