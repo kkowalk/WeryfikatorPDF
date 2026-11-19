@@ -95,7 +95,8 @@ Ocena na dzień podpisu S:
   bieżącego wpisu (bez historii).
 - Nie jest sprawdzane unieważnienie certyfikatów TSA ani delegowanych responderów OCSP.
 - Nie jest analizowane DocMDP. Wykrywane są tylko zmiany dopisane poza zakresem podpisu.
-- Podpis CMS musi być zakodowany w DER (BER nie jest obsługiwany).
+- Podpis CMS w kodowaniu BER (np. nieokreślona długość) jest przed weryfikacją przekodowywany na DER.
+  Elementy SET OF nie są przy tym sortowane, a z typów złożonych napisów scalany jest tylko OCTET STRING.
 - Proxy: Go nie korzysta z systemowego proxy Windows. W razie potrzeby ustaw zmienną `HTTPS_PROXY`.
 - Obsługiwany jest tylko format PAdES (bez XAdES i CAdES).
 

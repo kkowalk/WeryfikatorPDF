@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -360,6 +361,56 @@ func TestContentsLimit(t *testing.T) {
 		fr := e.analyzeFile(p)
 		if got := strings.Contains(fr.Error, "/Contents"); got != c.rejected {
 			t.Errorf("/Contents of %d hex digits: rejected=%v, want %v (%q)", c.hexLen, got, c.rejected, fr.Error)
+		}
+	}
+}
+
+// toBER re-encodes DER with indefinite lengths and every OCTET STRING split into a constructed one.
+func toBER(t *testing.T, der []byte) []byte {
+	var v asn1.RawValue
+	if _, err := asn1.Unmarshal(der, &v); err != nil {
+		t.Fatal(err)
+	}
+	switch {
+	case v.IsCompound:
+		out := []byte{v.FullBytes[0], 0x80}
+		for rest := v.Bytes; len(rest) > 0; {
+			var c asn1.RawValue
+			rest, _ = asn1.Unmarshal(rest, &c)
+			out = append(out, toBER(t, c.FullBytes)...)
+		}
+		return append(out, 0, 0)
+	case v.Class == asn1.ClassUniversal && v.Tag == asn1.TagOctetString && len(v.Bytes) > 1:
+		a, _ := asn1.Marshal(v.Bytes[:len(v.Bytes)/2])
+		b, _ := asn1.Marshal(v.Bytes[len(v.Bytes)/2:])
+		return append(append(append([]byte{0x24, 0x80}, a...), b...), 0, 0)
+	}
+	return der
+}
+
+func TestBERCMS(t *testing.T) {
+	_, leaf, _, key := pki(t, S.AddDate(1, 0, 0))
+	ps := findSignatures(buildPDF(t, leaf, key))[0]
+	var raw asn1.RawValue
+	asn1.Unmarshal(ps.DER, &raw)
+	ber := append(toBER(t, raw.FullBytes), make([]byte, 64)...) // with /Contents padding
+	if _, err := asn1.Unmarshal(ber, &raw); err == nil {
+		t.Fatal("test input is not BER")
+	}
+	der, n, err := berToDER(ber)
+	if err != nil || n != len(ber)-64 || !bytes.Equal(der, raw.FullBytes) {
+		t.Fatalf("berToDER: err=%v n=%d, identical=%v", err, n, bytes.Equal(der, raw.FullBytes))
+	}
+	c, err := parseCMS(ber)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.verify(ps.Signed...); err != nil {
+		t.Fatal("valid BER signature rejected:", err)
+	}
+	for _, bad := range [][]byte{ber[:len(ber)-70], append(bytes.Repeat([]byte{0x30, 0x80}, 100), make([]byte, 200)...), {0x04, 0x80, 0, 0}, {0x30, 0x84, 0xff, 0xff, 0xff, 0xff}} {
+		if _, _, err := berToDER(bad); err == nil {
+			t.Errorf("malformed BER % x… accepted", bad[:4])
 		}
 	}
 }

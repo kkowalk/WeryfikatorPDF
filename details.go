@@ -209,12 +209,17 @@ func attrList(m map[string]asn1.RawValue) string {
 
 func cmsDetails(ps pdfSig, c *cmsSig) []kv {
 	var raw asn1.RawValue
-	asn1.Unmarshal(ps.DER, &raw) // strip /Contents zero padding
+	cms, enc := []byte(nil), "DER"
+	if _, err := asn1.Unmarshal(ps.DER, &raw); err == nil { // strip /Contents zero padding
+		cms = raw.FullBytes
+	} else if _, n, err := berToDER(ps.DER); err == nil {
+		cms, enc = ps.DER[:n], "BER (przekodowane na DER do weryfikacji)"
+	}
 	br := ps.ByteRange
 	out := []kv{
 		{"SubFilter", ps.SubFilter},
 		{"ByteRange", fmt.Sprintf("[%d %d %d %d] — podpisane bajty 0–%d oraz %d–%d", br[0], br[1], br[2], br[3], br[1]-1, br[2], br[2]+br[3]-1)},
-		{"Struktura CMS", fmt.Sprintf("%d B, SHA-256 %s", len(raw.FullBytes), sha256hex(raw.FullBytes))},
+		{"Struktura CMS", fmt.Sprintf("%d B, kodowanie %s, SHA-256 %s", len(cms), enc, sha256hex(cms))},
 	}
 	sid := "issuerAndSerialNumber"
 	if c.si.SID.Class == asn1.ClassContextSpecific {

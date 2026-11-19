@@ -98,11 +98,15 @@ type cmsSig struct {
 	crlsRaw  []byte
 }
 
-// ponytail: DER only; BER-encoded (indefinite length) CMS is rejected with a clear error.
 func parseCMS(der []byte) (*cmsSig, error) {
+	// RFC 5652 allows BER (signed attributes are DER, so re-encoding keeps them byte-identical);
+	// for DER input the conversion is the identity.
+	if d, _, err := berToDER(der); err == nil {
+		der = d
+	}
 	var ci contentInfo
 	if _, err := asn1.Unmarshal(der, &ci); err != nil {
-		return nil, fmt.Errorf("nieprawidłowa struktura CMS (obsługiwane jest kodowanie DER): %w", err)
+		return nil, fmt.Errorf("nieprawidłowa struktura CMS: %w", err)
 	}
 	if !ci.ContentType.Equal(oidSignedData) {
 		return nil, errors.New("zawartość nie jest CMS SignedData")
@@ -137,6 +141,108 @@ func parseCMS(der []byte) (*cmsSig, error) {
 		return nil, errors.New("certyfikat podpisującego nie jest dołączony do podpisu")
 	}
 	return c, nil
+}
+
+var errBER = errors.New("nieprawidłowe kodowanie BER")
+
+// berToDER re-encodes the first element of b with minimal definite lengths and primitive OCTET STRINGs.
+// It returns the DER and the number of input bytes consumed (trailing /Contents padding is ignored).
+// shortcut: SET OF is not re-sorted and constructed strings other than OCTET STRING are kept; extend if a real signer needs it.
+func berToDER(b []byte) ([]byte, int, error) {
+	id, c, n, err := berElem(b, 0)
+	if err != nil {
+		return nil, 0, err
+	}
+	return derTLV(id, c), n, nil
+}
+
+func berElem(b []byte, depth int) (id, content []byte, n int, err error) {
+	if depth > 64 || len(b) < 2 {
+		return nil, nil, 0, errBER
+	}
+	i := 1
+	if b[0]&0x1f == 0x1f { // high tag number form
+		for i < len(b) && b[i]&0x80 != 0 {
+			i++
+		}
+		i++
+	}
+	if i >= len(b) {
+		return nil, nil, 0, errBER
+	}
+	id, cons := b[:i], b[0]&0x20 != 0
+	l := int(b[i])
+	i++
+	indef := l == 0x80
+	if indef && !cons {
+		return nil, nil, 0, errBER
+	}
+	if l > 0x80 {
+		k := l & 0x7f
+		if k > 4 || len(b)-i < k {
+			return nil, nil, 0, errBER
+		}
+		l = 0
+		for _, x := range b[i : i+k] {
+			l = l<<8 | int(x)
+		}
+		i += k
+	}
+	if !indef && (l < 0 || l > len(b)-i) {
+		return nil, nil, 0, errBER
+	}
+	if !cons {
+		return id, b[i : i+l], i + l, nil
+	}
+	end := len(b)
+	if !indef {
+		end = i + l
+	}
+	octets := len(id) == 1 && id[0] == 0x24 // constructed OCTET STRING → primitive
+	if octets {
+		id = []byte{0x04}
+	}
+	for {
+		if indef {
+			if end-i < 2 {
+				return nil, nil, 0, errBER
+			}
+			if b[i] == 0 && b[i+1] == 0 {
+				i += 2
+				break
+			}
+		} else if i == end {
+			break
+		}
+		cid, cc, cn, err := berElem(b[i:end], depth+1)
+		if err != nil {
+			return nil, nil, 0, err
+		}
+		i += cn
+		if octets {
+			if len(cid) != 1 || cid[0] != 0x04 {
+				return nil, nil, 0, errBER
+			}
+			content = append(content, cc...)
+		} else {
+			content = append(content, derTLV(cid, cc)...)
+		}
+	}
+	return id, content, i, nil
+}
+
+func derTLV(id, c []byte) []byte {
+	out := append([]byte{}, id...)
+	if n := len(c); n < 0x80 {
+		out = append(out, byte(n))
+	} else {
+		var l []byte
+		for ; n > 0; n >>= 8 {
+			l = append([]byte{byte(n)}, l...)
+		}
+		out = append(append(out, 0x80|byte(len(l))), l...)
+	}
+	return append(out, c...)
 }
 
 func parseAttrs(b []byte) map[string]asn1.RawValue {

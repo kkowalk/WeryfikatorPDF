@@ -50,7 +50,7 @@ wynik „ważny” jest wydawany <b>z zastrzeżeniem</b> — zakłada, że podpi
 Wszystkie wykorzystane dane zapisano w katalogu <span class="mono">dowody/</span> — można je zweryfikować niezależnie.</li>
 <li>Ograniczenia wersji: podpisy XML list zaufanych usług nie są weryfikowane (integralność zapewnia HTTPS ze źródeł wskazanych w LOTL);
 z kwalifikatorów usług (ServiceInformationExtensions) uwzględniany jest tylko zakres ForeSignatures/ForeSeals z bieżącego wpisu; nie jest sprawdzany status unieważnienia certyfikatów TSA i delegowanych responderów OCSP;
-nie jest analizowane uprawnienie do zmian po podpisaniu (DocMDP) — wykrywane są jedynie zmiany poza zakresem podpisu; obsługiwane jest kodowanie DER podpisu CMS.</li>
+nie jest analizowane uprawnienie do zmian po podpisaniu (DocMDP) — wykrywane są jedynie zmiany poza zakresem podpisu; podpis CMS w kodowaniu BER jest przed weryfikacją przekodowywany na DER (bez sortowania SET OF).</li>
 </ul>`
 
 // copyJS puts the timeline table into the clipboard with inline styles and fixed column widths,
