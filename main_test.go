@@ -414,3 +414,27 @@ func TestBERCMS(t *testing.T) {
 		}
 	}
 }
+
+func TestESSMissingBySubFilter(t *testing.T) {
+	_, leaf, _, key := pki(t, S.AddDate(1, 0, 0))
+	data := buildPDF(t, leaf, key)
+	e := newEnv(t.TempDir(), true)
+	for sf, want := range map[string]string{"ETSI.CAdES.detached": "warn", "adbe.pkcs7.detached": "ok", "": "warn"} {
+		ps := findSignatures(data)[0]
+		ps.SubFilter = sf
+		c, err := parseCMS(ps.DER)
+		if err != nil {
+			t.Fatal(err)
+		}
+		delete(c.signed, oidSigningCertV2)
+		got := ""
+		for _, ch := range e.evalSig(1, "a.pdf", ps, c, nil, nil, newPool(), data).Checks {
+			if ch.Name == "Powiązanie certyfikatu z podpisem" {
+				got = ch.State
+			}
+		}
+		if got != want {
+			t.Errorf("SubFilter %q without ESS: %q, want %q", sf, got, want)
+		}
+	}
+}

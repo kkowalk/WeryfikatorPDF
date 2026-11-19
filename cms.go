@@ -363,7 +363,7 @@ func (c *cmsSig) checkESS() (present bool, err error) {
 			}
 		}
 		if _, err := asn1.Unmarshal(firstValue(v), &sc); err != nil || len(sc.Certs) == 0 {
-			return true, errors.New("nieprawidłowy atrybut signing-certificate-v2")
+			return true, fmt.Errorf("nieprawidłowy atrybut signing-certificate-v2 (%v; wartość DER: %x)", essErr(err), firstValue(v))
 		}
 		h := crypto.SHA256 // DEFAULT per RFC 5035
 		if len(sc.Certs[0].Alg.Algorithm) > 0 {
@@ -379,7 +379,7 @@ func (c *cmsSig) checkESS() (present bool, err error) {
 	if v, ok := c.signed[oidSigningCertV1]; ok {
 		var sc struct{ Certs []struct{ Hash []byte } }
 		if _, err := asn1.Unmarshal(firstValue(v), &sc); err != nil || len(sc.Certs) == 0 {
-			return true, errors.New("nieprawidłowy atrybut signing-certificate")
+			return true, fmt.Errorf("nieprawidłowy atrybut signing-certificate (%v; wartość DER: %x)", essErr(err), firstValue(v))
 		}
 		if !bytes.Equal(digest(crypto.SHA1, c.signer.Raw), sc.Certs[0].Hash) {
 			return true, errors.New("skrót certyfikatu w atrybucie signing-certificate nie zgadza się z certyfikatem podpisującego")
@@ -387,6 +387,13 @@ func (c *cmsSig) checkESS() (present bool, err error) {
 		return true, nil
 	}
 	return false, nil
+}
+
+func essErr(err error) any {
+	if err == nil {
+		return "pusta lista certs"
+	}
+	return err
 }
 
 func (c *cmsSig) signingTime() (time.Time, bool) {

@@ -430,8 +430,10 @@ func (e *env) evalSig(n int, fname string, ps pdfSig, c *cmsSig, perr error, doc
 	}
 	if present, err := c.checkESS(); err != nil {
 		s.add("Powiązanie certyfikatu z podpisem", "fail", err.Error())
+	} else if !present && (ps.SubFilter == "adbe.pkcs7.detached" || ps.SubFilter == "adbe.pkcs7.sha1") {
+		s.add("Powiązanie certyfikatu z podpisem", "ok", "Atrybut signing-certificate(-v2) nieobecny — niewymagany dla SubFilter "+ps.SubFilter+" (ISO 32000-1); certyfikat podpisującego nie jest objęty podpisem.")
 	} else if !present {
-		s.add("Powiązanie certyfikatu z podpisem", "warn", "Brak atrybutu signing-certificate(-v2) wymaganego w PAdES — certyfikat nie jest chroniony podpisem.")
+		s.add("Powiązanie certyfikatu z podpisem", "warn", "Brak atrybutu signing-certificate(-v2) wymaganego w PAdES (ETSI EN 319 142-1) — certyfikat nie jest chroniony podpisem.")
 	} else {
 		s.add("Powiązanie certyfikatu z podpisem", "ok", "Skrót certyfikatu w atrybucie signing-certificate zgodny.")
 	}
