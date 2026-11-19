@@ -146,8 +146,8 @@ func keyDesc(pub any) string {
 	return fmt.Sprintf("%T", pub)
 }
 
-func qcStatements(c *x509.Certificate) []string {
-	var out []string
+// qcList returns the QcStatement OIDs of c and the QcType OIDs (ETSI EN 319 412-5).
+func qcList(c *x509.Certificate) (ids, types []string) {
 	for _, x := range c.Extensions {
 		if x.Id.String() != "1.3.6.1.5.5.7.1.3" {
 			continue
@@ -158,19 +158,33 @@ func qcStatements(c *x509.Certificate) []string {
 		}
 		asn1.Unmarshal(x.Value, &sts)
 		for _, st := range sts {
-			name := qcNames[st.ID.String()]
-			if name == "" {
-				name = st.ID.String()
-			}
+			ids = append(ids, st.ID.String())
 			if st.ID.String() == "0.4.0.1862.1.6" {
-				var types []asn1.ObjectIdentifier
-				asn1.Unmarshal(st.Info.FullBytes, &types)
-				for _, t := range types {
-					name += " " + map[string]string{"0.4.0.1862.1.6.1": "esign (podpis)", "0.4.0.1862.1.6.2": "eseal (pieczęć)", "0.4.0.1862.1.6.3": "web"}[t.String()]
+				var ts []asn1.ObjectIdentifier
+				asn1.Unmarshal(st.Info.FullBytes, &ts)
+				for _, t := range ts {
+					types = append(types, t.String())
 				}
 			}
-			out = append(out, name)
 		}
+	}
+	return ids, types
+}
+
+func qcStatements(c *x509.Certificate) []string {
+	ids, types := qcList(c)
+	var out []string
+	for _, id := range ids {
+		name := qcNames[id]
+		if name == "" {
+			name = id
+		}
+		if id == "0.4.0.1862.1.6" {
+			for _, t := range types {
+				name += " " + map[string]string{"0.4.0.1862.1.6.1": "esign (podpis)", "0.4.0.1862.1.6.2": "eseal (pieczęć)", "0.4.0.1862.1.6.3": "web"}[t]
+			}
+		}
+		out = append(out, name)
 	}
 	return out
 }

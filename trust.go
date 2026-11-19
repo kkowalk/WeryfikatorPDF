@@ -26,6 +26,7 @@ const lotlURL = "https://ec.europa.eu/tools/lotl/eu-lotl.xml"
 type evidence struct {
 	dir   string
 	saved map[[32]byte]string
+	Errs  []string // failed writes, listed in index.html
 }
 
 // save stores b under dowody/ and returns the path relative to the report folder.
@@ -35,10 +36,12 @@ func (e *evidence) save(prefix, ext string, b []byte) string {
 		return p
 	}
 	name := fmt.Sprintf("%s-%x.%s", prefix, h[:8], ext)
-	if err := os.MkdirAll(filepath.Join(e.dir, "dowody"), 0o700); err != nil {
-		return ""
+	err := os.MkdirAll(filepath.Join(e.dir, "dowody"), 0o700)
+	if err == nil {
+		err = os.WriteFile(filepath.Join(e.dir, "dowody", name), b, 0o600)
 	}
-	if err := os.WriteFile(filepath.Join(e.dir, "dowody", name), b, 0o600); err != nil {
+	if err != nil {
+		e.Errs = append(e.Errs, "Nie zapisano dowodu "+name+": "+err.Error())
 		return ""
 	}
 	e.saved[h] = "dowody/" + name

@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"crypto"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -436,5 +437,77 @@ func TestESSMissingBySubFilter(t *testing.T) {
 		if got != want {
 			t.Errorf("SubFilter %q without ESS: %q, want %q", sf, got, want)
 		}
+	}
+}
+
+func TestQualification(t *testing.T) {
+	oid := func(s ...int) asn1.ObjectIdentifier { return asn1.ObjectIdentifier(s) }
+	qc := func(seal bool, ids ...asn1.ObjectIdentifier) []pkix.Extension {
+		type st struct {
+			ID   asn1.ObjectIdentifier
+			Info asn1.RawValue `asn1:"optional"`
+		}
+		var sts []st
+		for _, id := range ids {
+			sts = append(sts, st{ID: id})
+		}
+		if seal {
+			types, _ := asn1.Marshal([]asn1.ObjectIdentifier{oid(0, 4, 0, 1862, 1, 6, 2)})
+			sts = append(sts, st{oid(0, 4, 0, 1862, 1, 6), asn1.RawValue{FullBytes: types}})
+		}
+		v, _ := asn1.Marshal(sts)
+		return []pkix.Extension{{Id: oid(1, 3, 6, 1, 5, 5, 7, 1, 3), Value: v}}
+	}
+	comp, sscd := oid(0, 4, 0, 1862, 1, 1), oid(0, 4, 0, 1862, 1, 4)
+	ca, caKey := issue(t, &x509.Certificate{SerialNumber: big.NewInt(1), Subject: pkix.Name{CommonName: "CA"}, NotBefore: S.AddDate(-1, 0, 0), NotAfter: S.AddDate(1, 0, 0)}, nil, nil)
+	for _, c := range []struct {
+		name, typ, want string
+		seal            bool
+		asi             []string
+		ids             []asn1.ObjectIdentifier
+	}{
+		{"no QcCompliance", "CA/QC", "NIE — certyfikat nie deklaruje", false, nil, []asn1.ObjectIdentifier{sscd}},
+		{"issuer not CA/QC", "CA/PKC", "NIE — wystawca nie miał", false, nil, []asn1.ObjectIdentifier{comp, sscd}},
+		{"seal from ForeSignatures-only service", "CA/QC", "NIE — usługa wystawcy (CA/QC) nie obejmuje pieczęci", true, []string{"http://uri.etsi.org/TrstSvc/TrustedList/SvcInfoExt/ForeSignatures"}, []asn1.ObjectIdentifier{comp, sscd}},
+		{"qualified signature", "CA/QC", "TAK — kwalifikowany podpis", false, nil, []asn1.ObjectIdentifier{comp, sscd}},
+		{"qualified seal", "CA/QC", "TAK — kwalifikowana pieczęć", true, []string{"http://uri.etsi.org/TrstSvc/TrustedList/SvcInfoExt/ForeSeals"}, []asn1.ObjectIdentifier{comp, sscd}},
+		{"no QSCD", "CA/QC", "CZĘŚCIOWO — zaawansowany podpis", false, nil, []asn1.ObjectIdentifier{comp}},
+	} {
+		leaf, _ := issue(t, &x509.Certificate{SerialNumber: big.NewInt(2), Subject: pkix.Name{CommonName: "L"}, NotBefore: S.AddDate(-1, 0, 0), NotAfter: S.AddDate(1, 0, 0),
+			ExtraExtensions: qc(c.seal, c.ids...)}, ca, caKey)
+		anchor := tlWith(ca, c.typ, "granted", S.AddDate(-2, 0, 0)).entries
+		anchor[0].ASI = c.asi
+		if got := qualification(leaf, anchor, S); !strings.HasPrefix(got, c.want) {
+			t.Errorf("%s: %q, want prefix %q", c.name, got, c.want)
+		}
+	}
+}
+
+func TestBrokenContentsAndUnsupported(t *testing.T) {
+	_, leaf, _, key := pki(t, S.AddDate(1, 0, 0))
+	pdf := buildPDF(t, leaf, key)
+	pdf[findSignatures(pdf)[0].ByteRange[2]-2] = 'x' // padding digit before '>': not hex, the signature must stay in the report as broken
+	sigs := findSignatures(pdf)
+	if len(sigs) != 1 || sigs[0].DER != nil {
+		t.Fatalf("signature with invalid /Contents hex: %d signatures, DER nil=%v", len(sigs), len(sigs) == 1 && sigs[0].DER == nil)
+	}
+	_, err := parseCMS(sigs[0].DER)
+	if err == nil || errState(err) != "fail" {
+		t.Fatalf("broken /Contents: err=%v state=%s", err, errState(err))
+	}
+	if err := verifyPub("ed25519", crypto.SHA256, false, nil, nil); errState(err) != "unknown" {
+		t.Errorf("unsupported key type gives %q, want unknown", errState(err))
+	}
+	if safeName("a#b%c") != "a_b_c" {
+		t.Errorf("safeName keeps # or %%: %q", safeName("a#b%c"))
+	}
+}
+
+func TestEvidenceSaveErrorIsReported(t *testing.T) {
+	f := filepath.Join(t.TempDir(), "plik")
+	os.WriteFile(f, nil, 0o600)
+	ev := &evidence{dir: f, saved: map[[32]byte]string{}} // dir is a file: dowody/ cannot be created
+	if p := ev.save("crl", "crl", []byte{1}); p != "" || len(ev.Errs) != 1 {
+		t.Fatalf("save into unwritable dir: path=%q errs=%v", p, ev.Errs)
 	}
 }

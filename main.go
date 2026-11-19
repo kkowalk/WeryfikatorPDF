@@ -8,7 +8,6 @@ import (
 	"crypto"
 	"crypto/sha256"
 	"crypto/x509"
-	"encoding/asn1"
 	"encoding/hex"
 	"errors"
 	"flag"
@@ -415,7 +414,7 @@ func (e *env) evalSig(n int, fname string, ps pdfSig, c *cmsSig, perr error, doc
 	s := &sigReport{N: n, Kind: "Podpis"}
 	s.coverage(ps, data, e.ev)
 	if perr != nil {
-		s.add("Struktura podpisu", "fail", perr.Error())
+		s.add("Struktura podpisu", errState(perr), perr.Error())
 		s.finish()
 		return s
 	}
@@ -424,12 +423,12 @@ func (e *env) evalSig(n int, fname string, ps pdfSig, c *cmsSig, perr error, doc
 	s.CMS = cmsDetails(ps, c)
 
 	if err := c.verify(ps.Signed...); err != nil {
-		s.add("Integralność i podpis kryptograficzny", "fail", err.Error())
+		s.add("Integralność i podpis kryptograficzny", errState(err), err.Error())
 	} else {
 		s.add("Integralność i podpis kryptograficzny", "ok", "Skrót zakresu ByteRange zgodny z messageDigest; podpis zweryfikowany kluczem publicznym certyfikatu podpisującego.")
 	}
 	if present, err := c.checkESS(); err != nil {
-		s.add("Powiązanie certyfikatu z podpisem", "fail", err.Error())
+		s.add("Powiązanie certyfikatu z podpisem", errState(err), err.Error())
 	} else if !present && (ps.SubFilter == "adbe.pkcs7.detached" || ps.SubFilter == "adbe.pkcs7.sha1") {
 		s.add("Powiązanie certyfikatu z podpisem", "ok", "Atrybut signing-certificate(-v2) nieobecny — niewymagany dla SubFilter "+ps.SubFilter+" (ISO 32000-1); certyfikat podpisującego nie jest objęty podpisem.")
 	} else if !present {
@@ -597,6 +596,14 @@ func (e *env) evalSig(n int, fname string, ps pdfSig, c *cmsSig, perr error, doc
 	return s
 }
 
+// errState: what the program cannot check is undecided, not invalid.
+func errState(err error) string {
+	if errors.Is(err, errUnsupported) {
+		return "unknown"
+	}
+	return "fail"
+}
+
 func (s *sigReport) finish() {
 	if len(s.Timeline) > 0 {
 		s.event(time.Now(), "Sporządzenie raportu", tool(), evEvidence)
@@ -633,31 +640,9 @@ func verdict(cs []check) string {
 }
 
 func qualification(signer *x509.Certificate, anchor []*tlEntry, S time.Time) string {
-	comp, sscd, seal := false, false, false
-	for _, x := range signer.Extensions {
-		if x.Id.String() != "1.3.6.1.5.5.7.1.3" {
-			continue
-		}
-		var sts []struct {
-			ID   asn1.ObjectIdentifier
-			Info asn1.RawValue `asn1:"optional"`
-		}
-		asn1.Unmarshal(x.Value, &sts)
-		for _, st := range sts {
-			switch st.ID.String() {
-			case "0.4.0.1862.1.1":
-				comp = true
-			case "0.4.0.1862.1.4":
-				sscd = true
-			case "0.4.0.1862.1.6":
-				var types []asn1.ObjectIdentifier
-				asn1.Unmarshal(st.Info.FullBytes, &types)
-				for _, t := range types {
-					seal = seal || t.String() == "0.4.0.1862.1.6.2"
-				}
-			}
-		}
-	}
+	ids, types := qcList(signer)
+	comp, sscd := slices.Contains(ids, "0.4.0.1862.1.1"), slices.Contains(ids, "0.4.0.1862.1.4")
+	seal := slices.Contains(types, "0.4.0.1862.1.6.2")
 	caQC, scope := false, false
 	for _, a := range anchor {
 		if st, ok := a.at(S); ok && positive(st.Status) && strings.HasSuffix(st.Type, "/CA/QC") {

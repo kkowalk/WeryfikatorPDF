@@ -56,11 +56,16 @@ func findSignatures(data []byte) []pdfSig {
 			return append(out, pdfSig{})
 		}
 		seen[br] = true
-		var der []byte // not decoded when /Contents exceeds maxContents; analyzeFile rejects the file
+		// der stays nil when /Contents exceeds maxContents (analyzeFile rejects the file) or is not
+		// valid hex — the signature is then reported as broken instead of silently dropped.
+		var der []byte
 		if c-b-2 <= 2*maxContents {
-			var err error
-			if der, err = hex.DecodeString(string(bytes.Join(bytes.Fields(data[b+1:c-1]), nil))); err != nil {
-				continue
+			hx := bytes.Join(bytes.Fields(data[b+1:c-1]), nil)
+			if len(hx)%2 == 1 {
+				hx = append(hx, '0') // ISO 32000-1 §7.3.4.3: a missing final digit is 0
+			}
+			if d, err := hex.DecodeString(string(hx)); err == nil {
+				der = d
 			}
 		}
 		s := pdfSig{ByteRange: br, DER: der, End: c + d}

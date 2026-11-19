@@ -119,6 +119,7 @@ func parseCMS(der []byte) (*cmsSig, error) {
 		return nil, fmt.Errorf("oczekiwano jednego SignerInfo, jest %d", len(sd.SignerInfos))
 	}
 	c := &cmsSig{si: sd.SignerInfos[0], eType: sd.EncapContent.EContentType, crlsRaw: sd.CRLs.FullBytes}
+	var certErr error // first X.509 certificate Go could not read (e.g. brainpool curve)
 	for rest := sd.Certificates.Bytes; len(rest) > 0; {
 		var v asn1.RawValue
 		r, err := asn1.Unmarshal(rest, &v)
@@ -128,6 +129,8 @@ func parseCMS(der []byte) (*cmsSig, error) {
 		rest = r
 		if cert, err := x509.ParseCertificate(v.FullBytes); err == nil {
 			c.certs = append(c.certs, cert)
+		} else if v.Class == asn1.ClassUniversal && certErr == nil {
+			certErr = err
 		}
 	}
 	if b := sd.EncapContent.EContent.Bytes; len(b) > 0 {
@@ -137,11 +140,16 @@ func parseCMS(der []byte) (*cmsSig, error) {
 	}
 	c.signed = parseAttrs(c.si.SignedAttrs.Bytes)
 	c.unsigned = parseAttrs(c.si.UnsignedAttrs.Bytes)
-	if c.signer = findSigner(c.si.SID, c.certs); c.signer == nil {
+	if c.signer = findSigner(c.si.SID, c.certs); c.signer == nil && certErr != nil {
+		return nil, fmt.Errorf("nie odczytano certyfikatu dołączonego do podpisu: %v (%w)", certErr, errUnsupported)
+	} else if c.signer == nil {
 		return nil, errors.New("certyfikat podpisującego nie jest dołączony do podpisu")
 	}
 	return c, nil
 }
+
+// errUnsupported marks what this program cannot check (algorithm, key or curve) — not proof of an invalid signature.
+var errUnsupported = errors.New("nieobsługiwane przez program — weryfikacja niemożliwa, nie oznacza nieważności podpisu")
 
 var errBER = errors.New("nieprawidłowe kodowanie BER")
 
@@ -300,7 +308,7 @@ func digest(h crypto.Hash, parts ...[]byte) []byte {
 func (c *cmsSig) verify(content ...[]byte) error {
 	h, ok := hashByOID[c.si.DigestAlgorithm.Algorithm.String()]
 	if !ok {
-		return fmt.Errorf("nieobsługiwany algorytm skrótu %s", c.si.DigestAlgorithm.Algorithm)
+		return fmt.Errorf("algorytm skrótu %s: %w", c.si.DigestAlgorithm.Algorithm, errUnsupported)
 	}
 	d := digest(h, content...)
 	pss := c.si.SignatureAlgorithm.Algorithm.Equal(oidRSAPSS)
@@ -332,7 +340,7 @@ func verifyPub(pub any, h crypto.Hash, pss bool, d, sig []byte) error {
 		}
 		return errors.New("nieprawidłowy podpis ECDSA")
 	}
-	return fmt.Errorf("nieobsługiwany typ klucza %T", pub)
+	return fmt.Errorf("typ klucza %T: %w", pub, errUnsupported)
 }
 
 var x509Hash = map[x509.SignatureAlgorithm]crypto.Hash{
@@ -368,7 +376,7 @@ func (c *cmsSig) checkESS() (present bool, err error) {
 		h := crypto.SHA256 // DEFAULT per RFC 5035
 		if len(sc.Certs[0].Alg.Algorithm) > 0 {
 			if h, ok = hashByOID[sc.Certs[0].Alg.Algorithm.String()]; !ok {
-				return true, errors.New("nieobsługiwany algorytm w signing-certificate-v2")
+				return true, fmt.Errorf("algorytm skrótu w signing-certificate-v2: %w", errUnsupported)
 			}
 		}
 		if !bytes.Equal(digest(h, c.signer.Raw), sc.Certs[0].Hash) {

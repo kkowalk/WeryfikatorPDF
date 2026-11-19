@@ -130,6 +130,7 @@ var indexTpl = template.Must(template.New("i").Parse(`<!doctype html><html lang=
 {{range .Files}}<tr class="{{.VerdictClass}}"><td><a href="{{.Report}}">{{.Name}}</a><br><span class="mono small">{{.SHA256}}</span></td><td>{{.Verdict}}{{if .Error}}<br>{{.Error}}{{end}}</td>
 <td>{{range .Sigs}}#{{.N}} {{.Kind}}: {{.Signer}} — {{.Date}} — <b>{{.Verdict}}</b><br>{{range .Notes}}<span class="small note">↳ {{.}}</span><br>{{end}}{{end}}</td></tr>{{end}}</table>
 {{if .TrustErrors}}<h3>Problemy z listami zaufanych usług</h3><ul>{{range .TrustErrors}}<li>{{.}}</li>{{end}}</ul>{{end}}
+{{if .EvidenceErrors}}<h3>Błędy zapisu dowodów — katalog dowody/ jest niekompletny</h3><ul>{{range .EvidenceErrors}}<li>{{.}}</li>{{end}}</ul>{{end}}
 <h3>Zapytania sieciowe</h3>
 <table><tr><th>Czas</th><th>Metoda</th><th>URL</th><th>Wynik</th><th>Kopia</th></tr>
 {{range .Log}}<tr><td>{{.When}}</td><td>{{.Method}}</td><td class="mono small">{{.URL}}</td><td>{{.Result}}</td><td>{{if .File}}<a href="{{.File}}">plik</a>{{end}}</td></tr>{{end}}</table>
@@ -158,7 +159,7 @@ func writeIndex(dir string, frs []*fileReport, e *env) error {
 	}
 	defer f.Close()
 	if err := indexTpl.Execute(f, map[string]any{"Files": frs, "Gen": fmtTime(time.Now()), "Tool": tool(),
-		"Log": e.net.Log, "TrustErrors": e.trust.Errors}); err != nil {
+		"Log": e.net.Log, "TrustErrors": e.trust.Errors, "EvidenceErrors": e.ev.Errs}); err != nil {
 		return err
 	}
 	return writeCSV(filepath.Join(dir, "podsumowanie.csv"), frs)
@@ -198,7 +199,7 @@ func cells(v ...string) []string {
 
 func safeName(s string) string {
 	s = strings.Map(func(r rune) rune {
-		if strings.ContainsRune(`<>:"/\|?*`, r) || r < 32 {
+		if strings.ContainsRune(`<>:"/\|?*#%`, r) || r < 32 { // # and % would break the link in index.html
 			return '_'
 		}
 		return r
